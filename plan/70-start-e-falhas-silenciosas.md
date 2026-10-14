@@ -198,6 +198,8 @@ Reusa o padrão já existente em `src/daemon/cron_log.ts` (mkdir best-effort).
   capturar na próxima ocorrência (pedir ao usuário pra repetir com o build
   instrumentado). **Precisa do caminho exato da pasta** → pedir ao usuário.
 
+  **Status (2026-10-14): armado.** Sem pasta de repro; o log da Wave 0 (incl. `reason=no_cwd` com `process.cwd()`/`has_config` no `detail`) captura uma nova ocorrência com o build instrumentado — a falha antiga sem log não é recuperável. Fallback `process.cwd()` do fork adiado até corroborar o cwd da sessão/worktree, não apenas `has_config=true`.
+
 ### Wave A — verbos legados e verbo desconhecido (mata o silêncio `:2542`)
 
 - **A1 — aliases explícitos**: `start|up|on` → `_cmdRoot` (mesma coisa, mas
@@ -271,14 +273,14 @@ Reusa o padrão já existente em `src/daemon/cron_log.ts` (mkdir best-effort).
 
 ## Definition of Done
 
-- [ ] 0.1 log de ciclo de vida gravando nos 4 cenários, sem lançar em FS read-only
-- [ ] 0.2 3ª linha de `_cmdStatus` com `reason` + idade
-- [ ] 0.3 causa raiz do relato confirmada e anotada neste plano (ou captura armada esperando a próxima ocorrência)
-- [ ] A1/A2 aliases + verbo desconhecido com aviso (testes de dispatcher)
-- [ ] A3 docstring + README + decisão no `plan/00-decisions.md`
+- [x] 0.1 log de ciclo de vida gravando nos 4 cenários, sem lançar em FS read-only
+- [x] 0.2 3ª linha de `_cmdStatus` com `reason` + idade
+- [x] 0.3 causa raiz do relato confirmada e anotada neste plano (ou captura armada esperando a próxima ocorrência) — armada via log da Wave 0; causa raiz não confirmada, sem pasta de repro
+- [x] A1/A2 aliases + verbo desconhecido com aviso (testes de dispatcher)
+- [x] A3 docstring + README + decisão no `plan/00-decisions.md`
 - [ ] B1/B2 nenhuma saída do root sem output quando o usuário invocou
 - [ ] C1/C2/C3 deadlines e `_cmdRootInFlight` destravável (teste de hang)
-- [ ] D2 `pnpm typecheck && pnpm test && pnpm build` verdes
+- [x] D2 `pnpm typecheck && pnpm test && pnpm build` verdes
 - [ ] D3 publicado (0.7.1) e validado no `pi` do usuário na pasta que falhava
 
 ## Próximos planos (candidatos)

@@ -423,6 +423,7 @@ real name to the peer.
 | `/remote-pi relay [start\|stop\|status]` | Relay-only control — leaves local mesh membership untouched (no verb = toggle) |
 | `/remote-pi relay url <url>` | Same as `set-relay` |
 | `/remote-pi config` | Show the effective relay URL and its source (env / config / default) |
+| `/remote-pi start` · `up` · `on` / `list` / `add-relay <url>` | Legacy aliases of `/remote-pi`, `/remote-pi devices`, `/remote-pi set-relay <url>`. Unknown subcommands print a warning and run nothing. |
 
 ### Daemon fleet (one supervisor, N background Pis — see [Daemon mode](#daemon-mode))
 
@@ -599,6 +600,7 @@ with a `[<cwd>]` prefix, so a single log stream shows every agent.
 | `~/.pi/remote/peers.json` | Per-machine | Paired mobile devices |
 | `~/.pi/remote/sessions/<name>/` | Per-session | Broker socket + `audit.jsonl` |
 | `~/.pi/remote/skills/agent-network/SKILL.md` | Per-user | Agent skill the LLM reads |
+| `~/.pi/remote/logs/remote-pi.log` | Per-user | Lifecycle log: auto-start decisions, root begin/end, lock/join/relay steps (one JSON object per line) |
 
 Override the relay for a single run without persisting:
 
@@ -609,6 +611,21 @@ REMOTE_PI_RELAY=https://staging.example.tld pi
 ---
 
 ## Troubleshooting
+
+**`/remote-pi` does nothing / status shows `⚪ Relay: off`.**
+Run `/remote-pi status`: with an outcome observed by this instance and a
+state that is not all 🟢 (including 🟡 waiting for first pairing), a third
+line gives that attempt's reason, age and log path. No outcome means no
+third line/path; status does not recover earlier processes' attempts.
+Instrumented history is in `~/.pi/remote/logs/remote-pi.log`: start with
+`tail -n 30 ~/.pi/remote/logs/remote-pi.log`, then filter by folder/pid/time:
+`jq -c --arg cwd "/exact/folder" 'select(.cwd == $cwd)' ~/.pi/remote/logs/remote-pi.log`.
+Use the selected pid and time window to find related begin/wait events
+(which may have no cwd). Pre-instrumentation failures cannot be recovered;
+reproduce a fresh occurrence using the instrumented build.
+Writes are deferred, ordered within each process and best-effort; abrupt
+process exit can lose buffered records. There is no log rotation.
+To bring the relay up directly, run `/remote-pi relay start`.
 
 **Footer says `🟡 relay waiting for pairing` even though I paired a device.**
 The icon reflects whether *any* device has been paired on this machine, not
@@ -629,6 +646,34 @@ with `agent_send` including `re: "<original-id>"` for correlation.
 agent-network session (UDS broker) and the relay handles each Pi process
 independently. If the relay refuses with `RoomAlreadyOpenError`, stop the
 other terminal first.
+
+---
+
+## Development & testing
+
+The extension suite points its lifecycle log at an isolated `REMOTE_PI_HOME` so
+tests never write to the real `~/.pi/remote/`. When `REMOTE_PI_HOME` is unset or
+empty the suite self-provisions a short-lived temp HOME under the system temp
+dir, so a plain `pnpm test` — and the `prepublishOnly` chain — still collects
+and runs. For fully hermetic runs, export a fresh HOME for the whole chain:
+
+```bash
+cd pi-extension
+export REMOTE_PI_HOME=$(mktemp -d /tmp/rp-check.XXXXXX)   # short path avoids UDS limits
+export npm_config_verify_deps_before_run=false
+pnpm typecheck && pnpm test && pnpm build
+```
+
+- Use one fresh `REMOTE_PI_HOME` per suite invocation and keep it exported for
+the entire `typecheck && test && build` chain; the same variable is required
+for prepublish verification.
+- Keep the directory short-lived but alive until Vitest exits: the logger
+  override is deliberately not reset in teardown, so the lifetime writer must
+  have a live destination and can never fall back to the real HOME.
+- Clean up the temp HOME only after every Pi/Vitest process has exited and any
+  logs/evidence you need have been copied out.
+- With no caller-supplied `REMOTE_PI_HOME`, the suite's self-provisioned temp
+  HOME is used instead; either way the real `~/.pi/remote/logs/` is untouched.
 
 ---
 
