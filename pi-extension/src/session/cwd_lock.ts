@@ -42,6 +42,8 @@ function locksDir(): string {
 
 export interface AcquiredLock {
   ok: true;
+  /** Already-computed address of the bound lock; diagnostics must not re-resolve cwd. */
+  lockPath: string;
   /** Manual release. Optional — process exit cleans up too. */
   release(): void;
 }
@@ -86,7 +88,7 @@ export function lockPathForCwd(cwd: string): string {
 
 /**
  * Attempts to acquire the cwd lock. Resolves with either:
- *   - `{ ok: true, release }` when we own it (server bound + retained).
+ *   - `{ ok: true, lockPath, release }` when we own it (server bound + retained).
  *   - `{ ok: false, lockPath }` when a live Pi already holds the lock.
  *
  * Self-healing path: if the prior holder crashed, the leftover socket file
@@ -126,7 +128,7 @@ export async function acquireCwdLock(cwd: string, name?: string): Promise<CwdLoc
   return { ok: false, lockPath };
 }
 
-function _acquired(server: Server, _lockPath: string): AcquiredLock {
+function _acquired(server: Server, lockPath: string): AcquiredLock {
   let released = false;
   // Don't keep the event loop alive just to hold the socket — the Pi
   // process has its own reasons to stay up (relay WS, broker, etc.).
@@ -134,6 +136,7 @@ function _acquired(server: Server, _lockPath: string): AcquiredLock {
   server.unref();
   return {
     ok: true,
+    lockPath,
     release: () => {
       if (released) return;
       released = true;

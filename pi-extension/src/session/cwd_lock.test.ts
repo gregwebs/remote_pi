@@ -136,3 +136,13 @@ describe("acquireCwdLock", () => {
     if (held.ok) held.release();
   });
 });
+
+// plan/70: successful diagnostics reuse the bound address, not another realpath.
+test("acquired lock exposes the already-computed lockPath", async () => {
+  const cwd = tmpCwd();
+  const lock = await acquireCwdLock(cwd, "diagnostics");
+  try {
+    expect(lock.ok).toBe(true);
+    expect(lock.lockPath).toBe(lockPathFor(cwd, "diagnostics"));
+  } finally { if (lock.ok) lock.release(); rmSync(cwd, { recursive: true, force: true }); }
+});

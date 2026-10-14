@@ -4,10 +4,10 @@
  * Post plano 06: no Noise XX. Pairing is `pair_request → pair_ok|pair_error`
  * over an opaque outer envelope whose `ct` is base64(JSON.stringify(inner)).
  */
-import { describe, expect, test, vi, beforeEach, afterEach } from "vitest";
+import { describe, expect, test, vi, beforeEach, afterEach, afterAll } from "vitest";
 import { EventEmitter } from "node:events";
 import { createHash } from "node:crypto";
-import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -238,8 +238,31 @@ const {
   _routeClientMessageFrom,
   _deliverMeshMessageToAgentForTest,
   CTRL_PREFIX,
+  _suggestVerb,
+  _getRootInFlightForTest,
 } = indexModule;
-const { acquireCwdLock } = await import("./session/cwd_lock.js");
+const { acquireCwdLock, lockPathFor } = await import("./session/cwd_lock.js");
+// plan/70: all existing/new tests reaching the gate/root use a tmp lifecycle log.
+const {
+  _setLifecycleLogPathForTest, _resetRootDiagnosticsForTest, _flushLifecycleLogForTest, lastRootOutcome,
+} = await import("./session/root_diagnostics.js");
+// Prefer the caller's isolated HOME; otherwise self-provision a short-lived temp
+// HOME so a plain `pnpm test` / `prepublishOnly` still collects and runs. Never
+// fall back to the real HOME: the lifetime logger override below must never be
+// able to write to the real ~/.pi/remote/logs/. mkdtempSync throws loudly if the
+// fallback directory cannot be created.
+const callerHome = process.env["REMOTE_PI_HOME"];
+const isolatedHome = callerHome
+  ? callerHome
+  : mkdtempSync(join(tmpdir(), "rp-ext-"));
+const _fileLifecycleDir = mkdtempSync(join(isolatedHome, "lc-"));
+const _fileLifecycleLog = join(_fileLifecycleDir, "remote-pi.log");
+_setLifecycleLogPathForTest(_fileLifecycleLog);
+afterAll(async () => {
+  await _flushLifecycleLogForTest();
+  // Keep the safe override/directory alive until worker exit, including late roots.
+});
+
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -381,6 +404,7 @@ describe("extension default export", () => {
     // without it every `/remote-pi relay …` silently reprinted the status panel.
     expect(registeredCommands).toContain("remote-pi relay");
     expect(registeredCommands).toContain("remote-pi config");
+    // plan/70 A1: start/list/add-relay (and join/leave/sessions) are flat-dispatch aliases/"removed" warnings — never registrations.
     for (const removed of [
       "remote-pi join", "remote-pi leave", "remote-pi sessions",
       "remote-pi relay start", "remote-pi relay stop",
@@ -5965,5 +5989,478 @@ describe("model meta", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+});
+
+describe("plan/70 Wave 0 — lifecycle log", () => {
+  const savedArgv = process.argv;
+  let testDir: string;
+  let logPath: string;
+  let savedDirectConfig: string | undefined;
+  let onSessionStart: (event: AnyEvent, ctx: unknown) => unknown;
+  const fixtureCwds = new Set<string>();
+  const newCwd = () => {
+    const cwd = mkdtempSync(join(testDir, "cwd-"));
+    fixtureCwds.add(cwd);
+    return cwd;
+  };
+  const events = (): Array<Record<string, unknown>> => existsSync(logPath)
+    ? readFileSync(logPath, "utf8").split("\n").filter(Boolean).map(l => JSON.parse(l) as Record<string, unknown>)
+    : [];
+  const statusText = async (): Promise<string> => {
+    const ctx = makeMockCtx();
+    await captureHandler("remote-pi status")("", ctx);
+    expect(ctx.ui.notify).toHaveBeenCalledTimes(1);
+    return ctx.ui.notify.mock.calls[0]![0] as string;
+  };
+  const rootDrains: Promise<unknown>[] = [];
+  const releaseDeferreds: Array<() => void> = [];
+  const fixtureLockPaths = new Set<string>();
+  const observe = (p: Promise<unknown>): void => { rootDrains.push(p.catch(() => undefined)); };
+  const observeAutoRoot = (): void => {
+    const p = _getRootInFlightForTest();
+    if (p) observe(p); // snapshot inner promise; do not invoke another root to drain it
+  };
+  const collectFixturePaths = (): void => {
+    if (typeof logPath !== "string") return; // first beforeEach has no test log yet
+    for (const e of events()) {
+      if (typeof e.cwd === "string" && fixtureCwds.has(e.cwd) && typeof e.lockPath === "string") {
+        fixtureLockPaths.add(e.lockPath);
+      }
+    }
+  };
+  const cleanupOwnedRun = async (): Promise<void> => {
+    // Settle every deferred FIRST; stop alone cannot resolve a captured promise.
+    for (const release of releaseDeferreds.splice(0)) release();
+    const pending = _getRootInFlightForTest();
+    if (pending) observe(pending);
+    await captureHandler("remote-pi stop")("", makeMockCtx()); // invalidate candidates
+    await Promise.all(rootDrains.splice(0)); // include explicit handler promises
+    await Promise.resolve(); // wrapper's existing finally reaction must finish too
+    await _flushLifecycleLogForTest();
+    collectFixturePaths(); // catches a lock_result produced during drainage too
+    // Release BEFORE assertions so an assertion failure cannot strand the lock.
+    // S13 registers its incumbent path and releases the incumbent in its finally.
+    _resetCwdLockForTest(); // after run drainage, never as its substitute
+    expect(_getRootInFlightForTest()).toBeNull();
+    expect(_getLockedNameForTest()).toBeNull();
+    expect(_hasMeshNodeForTest()).toBe(false);
+    for (const p of process.platform === "win32" ? [] : fixtureLockPaths) {
+      await vi.waitFor(() => expect(existsSync(p)).toBe(false)); // POSIX close completes async
+    }
+    fixtureLockPaths.clear(); fixtureCwds.clear();
+  };
+  beforeEach(async () => {
+    // Observe/drain prior run BEFORE resetting mocks, names, env or disposal.
+    await cleanupOwnedRun();
+    vi.clearAllMocks();
+    _knownPeers.length = 0; _consumeCalls.length = 0;
+    relayRef.current = null; relayInstances.length = 0;
+    _defaultConnectImpl = async () => undefined;
+    _setDisposedForTest(false); _resetAutoInitedForTest();
+    process.argv = ["node", "pi"];
+    savedDirectConfig = process.env["REMOTE_PI_DIRECT_CONFIG"];
+    delete process.env["REMOTE_PI_DIRECT_CONFIG"];
+    testDir = mkdtempSync(join(tmpdir(), "pi-ext-lc-"));
+    logPath = join(testDir, "remote-pi.log");
+    _setLifecycleLogPathForTest(logPath);
+    _resetRootDiagnosticsForTest();
+    onSessionStart = captureEventHandler("session_start") as
+      (event: AnyEvent, ctx: unknown) => unknown;
+  });
+  afterEach(async () => {
+    let drained = false;
+    try {
+      // Register actual paths from events (and any incumbent) before cleanup.
+      await _flushLifecycleLogForTest();
+      collectFixturePaths();
+      await cleanupOwnedRun();
+      drained = true;
+    } finally {
+      // If drainage failed, retain testDir/evidence; never point a live root at HOME.
+      _setLifecycleLogPathForTest(_fileLifecycleLog);
+      if (savedDirectConfig === undefined) delete process.env["REMOTE_PI_DIRECT_CONFIG"];
+      else process.env["REMOTE_PI_DIRECT_CONFIG"] = savedDirectConfig;
+      process.argv = savedArgv;
+      vi.restoreAllMocks();
+      _resetAutoInitedForTest(); _setDisposedForTest(false);
+      if (drained) rmSync(testDir, { recursive: true, force: true });
+    }
+  });
+  afterAll(async () => {
+    await cleanupOwnedRun();
+    expect(_getRootInFlightForTest()).toBeNull();
+    expect(_getLockedNameForTest()).toBeNull();
+  });
+  const configured = (auto = true) => {
+    process.env["REMOTE_PI_DIRECT_CONFIG"] = JSON.stringify({ agent_name: basename(testDir), auto_start_relay: auto });
+  };
+  const invokeStart = (ctx: unknown): void => {
+    try { onSessionStart({ type: "session_start" }, ctx); }
+    finally { observeAutoRoot(); }
+  };
+  const start = (cwd: string) => invokeStart(makeMockCtx(cwd));
+  const runRoot = (args: string, ctx: ReturnType<typeof makeMockCtx>) => {
+    const p = captureHandler("remote-pi")(args, ctx);
+    observe(p);
+    return p;
+  };
+  const finished = async () => {
+    const pending = _getRootInFlightForTest();
+    if (pending) { observe(pending); await pending; }
+    await Promise.resolve();
+    await _flushLifecycleLogForTest();
+    expect(events().at(-1)?.event).toBe("root_end");
+  };
+  test("S1 no local config", async () => {
+    const cwd = newCwd(); start(cwd);
+    await _flushLifecycleLogForTest();
+    expect(events()).toHaveLength(1);
+    expect(events()[0]).toMatchObject({ event: "session_start_autoinit", decision: "skip", reason: "no_local_config", cwd });
+    expect(_hasMeshNodeForTest()).toBe(false);
+    const text = await statusText(); expect(text).toContain("skipped — no_local_config"); expect(text).toContain(logPath);
+  });
+  test("S2 auto-start disabled", async () => {
+    configured(false); start(newCwd()); await _flushLifecycleLogForTest(); expect(events()).toHaveLength(1);
+    expect(events()[0]).toMatchObject({ decision: "skip", reason: "auto_start_relay_false" });
+    expect(await statusText()).toContain("skipped — auto_start_relay_false");
+  });
+  test("S3 config OK; yellow is not all green", async () => {
+    configured(); const cwd = newCwd(); const ctx = makeMockCtx(cwd);
+    invokeStart(ctx); await finished();
+    expect(events().map(e => e.event)).toEqual(["session_start_autoinit", "root_begin", "lock_result", "join_begin", "join_end", "relay_connect_begin", "relay_connect_end", "root_end"]);
+    expect(events()[0]).toMatchObject({ decision: "start" });
+    const lock = events()[2]!;
+    expect(lock).toMatchObject({ result: "ok", lockPath: lockPathFor(cwd, lock.name as string) });
+    expect(events()[4]).toMatchObject({ result: "ok" }); expect(events()[6]).toMatchObject({ result: "ok" });
+    expect(events()[7]).toMatchObject({ result: "ok", reason: "connected", cwd }); expect(events()[7]?.room).toEqual(expect.any(String));
+    expect(lastRootOutcome()).toMatchObject({ result: "ok", reason: "connected" });
+    expect(_hasMeshNodeForTest()).toBe(true); expect(_getState()).toBe("started");
+    const text = await statusText(); expect(text).toContain("🟡 Relay: on, waiting for first pairing"); expect(text).toContain("Last start: ok — connected");
+    const own = ctx.ui.notify.mock.calls.filter(c => String(c[0]).includes("Local mesh"));
+    expect(own).toHaveLength(1); expect(own[0]![0]).not.toContain("Last start");
+  });
+  test("S4 relay unreachable", async () => {
+    configured(); _defaultConnectImpl = async () => { throw new Error("ECONNREFUSED"); };
+    const ctx = makeMockCtx(newCwd()); invokeStart(ctx); await finished();
+    expect(events().find(e => e.event === "relay_connect_end")).toMatchObject({ result: "failed", reason: "relay_not_started" });
+    expect(events().at(-1)).toMatchObject({ result: "failed", reason: "relay_not_started" });
+    const own = ctx.ui.notify.mock.calls.filter(c => String(c[0]).includes("Local mesh"));
+    expect(own).toHaveLength(1); expect(own[0]![0]).not.toContain("Last start");
+    const text = await statusText(); expect(text).toContain("Last start: failed — relay_not_started"); expect(text).toContain(logPath);
+  });
+  test("S5 no ctx.cwd remains conservative", async () => {
+    configured(); invokeStart({ ui: { notify: vi.fn() }, abort: vi.fn() });
+    await _flushLifecycleLogForTest();
+    expect(events()).toHaveLength(1); expect(events()[0]).toMatchObject({ reason: "no_cwd", decision: "skip", detail: expect.stringMatching(/^process\.cwd\(\)=.+ has_config=true$/) });
+    expect(events()[0]).not.toHaveProperty("cwd");
+    await new Promise<void>(resolve => setImmediate(resolve));
+    expect(_hasMeshNodeForTest()).toBe(false); expect(relayInstances).toHaveLength(0);
+    const text = await statusText(); expect(text).toContain("skipped — no_cwd: process.cwd()=");
+  });
+  test("S5b no cwd, real config only: evidence is not session identity", async () => {
+    const processDir = newCwd(); mkdirSync(join(processDir, ".pi/remote-pi"), { recursive: true });
+    writeFileSync(join(processDir, ".pi/remote-pi/config.json"), JSON.stringify({ agent_name: "real", auto_start_relay: true }));
+    const spy = vi.spyOn(process, "cwd").mockReturnValue(processDir);
+    try { invokeStart({ ui: { notify: vi.fn() } }); } finally { spy.mockRestore(); }
+    await _flushLifecycleLogForTest();
+    expect(events()).toHaveLength(1); expect(events()[0]).toMatchObject({ reason: "no_cwd", detail: `process.cwd()=${processDir} has_config=true` });
+    expect(_getLockedNameForTest()).toBeNull(); expect(_hasMeshNodeForTest()).toBe(false); expect(relayInstances).toHaveLength(0);
+  });
+  test("S5c no-cwd diagnostics tolerate process.cwd throwing", async () => {
+    const spy = vi.spyOn(process, "cwd").mockImplementation(() => { throw new Error("ENOENT"); });
+    try { expect(() => invokeStart({ ui: { notify: vi.fn() } })).not.toThrow(); } finally { spy.mockRestore(); }
+    await _flushLifecycleLogForTest();
+    expect(events()).toHaveLength(1); expect(events()[0]).toMatchObject({ reason: "no_cwd", detail: "process.cwd()=<unavailable>" });
+    expect(_hasMeshNodeForTest()).toBe(false); expect(relayInstances).toHaveLength(0);
+  });
+  test("S6 print mode", async () => {
+    configured(); process.argv = ["node", "pi", "-p", "x"]; start(newCwd());
+    await _flushLifecycleLogForTest();
+    expect(events()[0]).toMatchObject({ decision: "skip", reason: "print_mode" }); expect(_hasMeshNodeForTest()).toBe(false);
+  });
+  test("S7 already initialized preserves outcome", async () => {
+    _setAutoInitedForTest(true); invokeStart(makeMockCtx(newCwd()));
+    await _flushLifecycleLogForTest();
+    expect(events()).toHaveLength(1); expect(events()[0]).toMatchObject({ reason: "already_inited" }); expect(lastRootOutcome()).toBeNull();
+  });
+  test("S8 logging failure is transparent", async () => {
+    const file = join(testDir, "file"); writeFileSync(file, "x"); _setLifecycleLogPathForTest(join(file, "log"));
+    configured(); start(newCwd()); await vi.waitFor(() => expect(lastRootOutcome()?.reason).toBe("connected"));
+    expect(_hasMeshNodeForTest()).toBe(true); expect(relayInstances).toHaveLength(1); expect(existsSync(join(file, "log"))).toBe(false);
+  });
+  test("S9 no outcome: exactly two status lines", async () => {
+    expect(await statusText()).toMatch(/^\[remote-pi\]\n  [^\n]+\n  [^\n]+$/);
+    expect(await statusText()).not.toContain(logPath);
+  });
+  test("H1: pending relay and queued alias are observable", async () => {
+    const cwd = newCwd();
+    process.env["REMOTE_PI_DIRECT_CONFIG"] = JSON.stringify({ agent_name: "H1", auto_start_relay: true });
+    const d = deferred<void>();
+    const cleanupError = new Error("test cleanup");
+    // Observe immediately, even if an assertion fails before connect captures d.
+    void d.promise.catch(() => undefined);
+    releaseDeferreds.push(() => d.reject(cleanupError));
+    _defaultConnectImpl = () => d.promise;
+    const drains: Promise<unknown>[] = [];
+    const secondCtx = makeMockCtx(cwd);
+    try {
+      const first = captureHandler("remote-pi")("", makeMockCtx(cwd));
+      drains.push(first.catch(() => undefined)); observe(first);
+      await vi.waitFor(async () => { await _flushLifecycleLogForTest(); expect(events().at(-1)?.event).toBe("relay_connect_begin"); });
+      expect(await statusText()).toContain("Last start: still running — connecting_relay (for ");
+      const second = captureHandler("remote-pi")("start", secondCtx);
+      drains.push(second.catch(() => undefined)); observe(second);
+      await vi.waitFor(async () => { await _flushLifecycleLogForTest(); expect(events().some(e => e.event === "root_wait_begin")).toBe(true); });
+      expect(events().some(e => e.event === "command" && e.verb === "start" && e.reason === "alias_of_root")).toBe(true);
+      expect(events().some(e => e.event === "root_wait_end")).toBe(false);
+      d.reject(cleanupError); // _cmdStart catches connect rejection; root settles normally
+      await Promise.all(drains);
+      await _flushLifecycleLogForTest();
+      const names = events().map(e => e.event);
+      expect(names.filter(n => n === "root_begin")).toHaveLength(1);
+      expect(names.indexOf("root_end")).toBeLessThan(names.indexOf("root_wait_end"));
+      expect(events().find(e => e.event === "root_end")).toMatchObject({ result: "failed", reason: "relay_not_started" });
+      expect(events().find(e => e.event === "root_wait_end")).toMatchObject({ result: "ok" });
+      expect(secondCtx.ui.notify).toHaveBeenCalledTimes(1);
+      expect(secondCtx.ui.notify.mock.calls[0]![0]).toContain("Last start: failed — relay_not_started");
+    } finally {
+      d.reject(cleanupError); // idempotent; never conditional on assertion success
+      await Promise.all(drains);
+      await _flushLifecycleLogForTest(); // both promises, if created, are observed AND drained
+      _defaultConnectImpl = async () => undefined;
+      try {
+        await captureHandler("remote-pi stop")("", makeMockCtx(cwd));
+      } finally {
+        _resetCwdLockForTest();
+        _resetAutoInitedForTest();
+      }
+    }
+  });
+  test("S11 all green with outcome omits third line", async () => {
+    _knownPeers.push({ name: "phone", remote_epk: "a".repeat(64), paired_at: "2026-10-14T00:00:00.000Z" });
+    configured(); onSessionStart = captureEventHandler("session_start") as typeof onSessionStart;
+    start(newCwd()); await finished();
+    expect(_hasMeshNodeForTest()).toBe(true); expect(_getState()).toBe("started");
+    const text = await statusText(); expect(text).toContain("🟢 Local mesh"); expect(text).toContain("🟢 Relay: on, waiting for an app");
+    expect(text).toMatch(/^\[remote-pi\]\n  [^\n]+\n  [^\n]+$/); expect(text).not.toContain("Last start");
+  });
+  test.each(["throwing ctx.cwd", "throwing process.cwd"])("S12 %s preserves rejection and finalizes", async kind => {
+    const root = runRoot; const error = new Error(kind);
+    const ctx = makeMockCtx();
+    let spy: ReturnType<typeof vi.spyOn> | undefined;
+    if (kind === "throwing ctx.cwd") Object.defineProperty(ctx, "cwd", { get() { throw error; } });
+    else { Reflect.deleteProperty(ctx, "cwd"); spy = vi.spyOn(process, "cwd").mockImplementation(() => { throw error; }); }
+    try { await expect(root("", ctx)).rejects.toBe(error); } finally { spy?.mockRestore(); }
+    await _flushLifecycleLogForTest();
+    expect(events().map(e => e.event)).toEqual(["root_begin", "root_end"]);
+    expect(events()[1]).toMatchObject({ result: "failed", reason: "exception", detail: error.message }); expect(events()[1]).not.toHaveProperty("cwd");
+    await root("", makeMockCtx(newCwd())); await _flushLifecycleLogForTest(); expect(events().filter(e => e.event === "root_begin")).toHaveLength(2);
+  });
+  test("S12b authoritative cwd accessor read only once", async () => {
+    const cwd = newCwd(); const ctx = makeMockCtx(); const getter = vi.fn(() => { if (getter.mock.calls.length > 1) throw new Error("second read"); return cwd; });
+    Object.defineProperty(ctx, "cwd", { get: getter }); await runRoot("", ctx); await _flushLifecycleLogForTest();
+    expect(getter).toHaveBeenCalledTimes(1); expect(events().at(-1)).toMatchObject({ reason: "no_local_config", cwd });
+  });
+  test("S13 daemon lock refusal records actual lockPath", async () => {
+    const cwd = newCwd(); configured(); const name = basename(testDir); const incumbent = await acquireCwdLock(cwd, name); expect(incumbent.ok).toBe(true); fixtureLockPaths.add(lockPathFor(cwd, name));
+    const saved = process.env["REMOTE_PI_DAEMON"]; const ctx = makeMockCtx(cwd);
+    try {
+      process.env["REMOTE_PI_DAEMON"] = "1"; await runRoot("", ctx); await _flushLifecycleLogForTest();
+      expect(events().find(e => e.event === "lock_result")).toMatchObject({ result: "refused", name, lockPath: lockPathFor(cwd, name) });
+      expect(events().at(-1)).toMatchObject({ result: "failed", reason: "lock_refused" });
+      expect(ctx.ui.notify).toHaveBeenCalledWith(expect.stringContaining("another live agent already owns"), "warning");
+      expect(_hasMeshNodeForTest()).toBe(false); expect(relayInstances).toHaveLength(0);
+    } finally { if (incumbent.ok) incumbent.release(); if (saved === undefined) delete process.env["REMOTE_PI_DAEMON"]; else process.env["REMOTE_PI_DAEMON"] = saved; }
+  });
+});
+
+describe("plan/70 Wave A — legacy and unknown verbs", () => {
+  const savedArgv = process.argv;
+  let testDir: string;
+  let logPath: string;
+  let savedDirectConfig: string | undefined;
+  let onSessionStart: (event: AnyEvent, ctx: unknown) => unknown;
+  const fixtureCwds = new Set<string>();
+  const newCwd = () => {
+    const cwd = mkdtempSync(join(testDir, "cwd-"));
+    fixtureCwds.add(cwd);
+    return cwd;
+  };
+  const events = (): Array<Record<string, unknown>> => existsSync(logPath)
+    ? readFileSync(logPath, "utf8").split("\n").filter(Boolean).map(l => JSON.parse(l) as Record<string, unknown>)
+    : [];
+  const statusText = async (): Promise<string> => {
+    const ctx = makeMockCtx();
+    await captureHandler("remote-pi status")("", ctx);
+    expect(ctx.ui.notify).toHaveBeenCalledTimes(1);
+    return ctx.ui.notify.mock.calls[0]![0] as string;
+  };
+  const rootDrains: Promise<unknown>[] = [];
+  const releaseDeferreds: Array<() => void> = [];
+  const fixtureLockPaths = new Set<string>();
+  const observe = (p: Promise<unknown>): void => { rootDrains.push(p.catch(() => undefined)); };
+  const observeAutoRoot = (): void => {
+    const p = _getRootInFlightForTest();
+    if (p) observe(p); // snapshot inner promise; do not invoke another root to drain it
+  };
+  const collectFixturePaths = (): void => {
+    if (typeof logPath !== "string") return; // first beforeEach has no test log yet
+    for (const e of events()) {
+      if (typeof e.cwd === "string" && fixtureCwds.has(e.cwd) && typeof e.lockPath === "string") {
+        fixtureLockPaths.add(e.lockPath);
+      }
+    }
+  };
+  const cleanupOwnedRun = async (): Promise<void> => {
+    // Settle every deferred FIRST; stop alone cannot resolve a captured promise.
+    for (const release of releaseDeferreds.splice(0)) release();
+    const pending = _getRootInFlightForTest();
+    if (pending) observe(pending);
+    await captureHandler("remote-pi stop")("", makeMockCtx()); // invalidate candidates
+    await Promise.all(rootDrains.splice(0)); // include explicit handler promises
+    await Promise.resolve(); // wrapper's existing finally reaction must finish too
+    await _flushLifecycleLogForTest();
+    collectFixturePaths(); // catches a lock_result produced during drainage too
+    // Release BEFORE assertions so an assertion failure cannot strand the lock.
+    // S13 registers its incumbent path and releases the incumbent in its finally.
+    _resetCwdLockForTest(); // after run drainage, never as its substitute
+    expect(_getRootInFlightForTest()).toBeNull();
+    expect(_getLockedNameForTest()).toBeNull();
+    expect(_hasMeshNodeForTest()).toBe(false);
+    for (const p of process.platform === "win32" ? [] : fixtureLockPaths) {
+      await vi.waitFor(() => expect(existsSync(p)).toBe(false)); // POSIX close completes async
+    }
+    fixtureLockPaths.clear(); fixtureCwds.clear();
+  };
+  beforeEach(async () => {
+    // Observe/drain prior run BEFORE resetting mocks, names, env or disposal.
+    await cleanupOwnedRun();
+    vi.clearAllMocks();
+    _setRelayCalls.length = 0;
+    _knownPeers.length = 0; _consumeCalls.length = 0;
+    relayRef.current = null; relayInstances.length = 0;
+    _defaultConnectImpl = async () => undefined;
+    _setDisposedForTest(false); _resetAutoInitedForTest();
+    process.argv = ["node", "pi"];
+    savedDirectConfig = process.env["REMOTE_PI_DIRECT_CONFIG"];
+    delete process.env["REMOTE_PI_DIRECT_CONFIG"];
+    testDir = mkdtempSync(join(tmpdir(), "pi-ext-lc-"));
+    logPath = join(testDir, "remote-pi.log");
+    _setLifecycleLogPathForTest(logPath);
+    _resetRootDiagnosticsForTest();
+    onSessionStart = captureEventHandler("session_start") as
+      (event: AnyEvent, ctx: unknown) => unknown;
+  });
+  afterEach(async () => {
+    let drained = false;
+    try {
+      // Register actual paths from events (and any incumbent) before cleanup.
+      await _flushLifecycleLogForTest();
+      collectFixturePaths();
+      await cleanupOwnedRun();
+      drained = true;
+    } finally {
+      // If drainage failed, retain testDir/evidence; never point a live root at HOME.
+      _setLifecycleLogPathForTest(_fileLifecycleLog);
+      if (savedDirectConfig === undefined) delete process.env["REMOTE_PI_DIRECT_CONFIG"];
+      else process.env["REMOTE_PI_DIRECT_CONFIG"] = savedDirectConfig;
+      process.argv = savedArgv;
+      _savedRelayUrl = null;
+      vi.restoreAllMocks();
+      _resetAutoInitedForTest(); _setDisposedForTest(false);
+      if (drained) rmSync(testDir, { recursive: true, force: true });
+    }
+  });
+  afterAll(async () => {
+    await cleanupOwnedRun();
+    expect(_getRootInFlightForTest()).toBeNull();
+    expect(_getLockedNameForTest()).toBeNull();
+  });
+  const rootRan = () => events().some(e => e.event === "root_begin");
+  const act = async (args: string) => {
+    const ctx = makeMockCtx(newCwd());
+    const p = captureHandler("remote-pi")(args, ctx); observe(p); await p;
+    await _flushLifecycleLogForTest();
+    return ctx;
+  };
+  const warning = (ctx: ReturnType<typeof makeMockCtx>): string => {
+    expect(ctx.ui.notify).toHaveBeenCalledTimes(1);
+    expect(ctx.ui.notify.mock.calls[0]![1]).toBe("warning");
+    expect(rootRan()).toBe(false); expect(_getLockedNameForTest()).toBeNull();
+    return ctx.ui.notify.mock.calls[0]![0] as string;
+  };
+  test.each(["start", "up", "on"])("W1 /remote-pi %s runs root and logs alias_of_root", async verb => {
+    const ctx = await act(verb);
+    expect(events()[0]).toMatchObject({ event: "command", verb, reason: "alias_of_root" });
+    expect(events()[1]?.event).toBe("root_begin"); expect(_getLockedNameForTest()).not.toBeNull();
+    const own = ctx.ui.notify.mock.calls.find(c => String(c[0]).includes("Local mesh"));
+    expect(own).toBeDefined(); expect(own![0]).not.toContain("Last start");
+    expect(events().at(-1)).toMatchObject({ event: "root_end", result: "failed", reason: "no_local_config" });
+  });
+  test("W2 list aliases devices", async () => {
+    const ctx = await act("list");
+    expect(ctx.ui.notify).toHaveBeenCalledExactlyOnceWith("[remote-pi] No paired devices.", "info");
+    expect(rootRan()).toBe(false); expect(_getLockedNameForTest()).toBeNull();
+    expect(events()[0]).toMatchObject({ event: "command", verb: "list", reason: "alias_of_devices" });
+  });
+  test("W3 add-relay URL aliases set-relay", async () => {
+    await act("add-relay http://x"); expect(_setRelayCalls).toEqual(["http://x"]);
+    expect(rootRan()).toBe(false); expect(_getLockedNameForTest()).toBeNull();
+    expect(events()[0]).toMatchObject({ verb: "add-relay", reason: "alias_of_set_relay" });
+  });
+  test("W4 add-relay without URL prints canonical usage", async () => {
+    expect(warning(await act("add-relay"))).toContain("Usage: /remote-pi set-relay");
+    expect(_setRelayCalls).toHaveLength(0);
+  });
+  test.each([["join", "Use /remote-pi to join"], ["leave", "Use /remote-pi stop"], ["sessions", "Use /remote-pi peers"]])("W5 %s warns removed and runs nothing", async (verb, replacement) => {
+    const text = warning(await act(verb));
+    expect(text).toContain(`"/remote-pi ${verb}" was removed`); expect(text).toContain(replacement);
+    expect(events()[0]).toMatchObject({ event: "command", verb, reason: "removed_verb" });
+  });
+  test("W6 statu suggests status and never runs root", async () => {
+    const text = warning(await act("statu"));
+    expect(text).toContain('Unknown subcommand "statu" — nothing was run.');
+    expect(text).toContain('Did you mean "/remote-pi status"?'); expect(text).toContain("Subcommands: setup, status, stop");
+    expect(events()[0]).toMatchObject({ reason: "unknown_verb", detail: "status" });
+  });
+  test("W7 xyzzy lists canonical verbs without suggestion", async () => {
+    const text = warning(await act("xyzzy"));
+    expect(text).toContain('Unknown subcommand "xyzzy"'); expect(text).not.toContain("Did you mean");
+    const listed = text.split("Subcommands: ")[1]!.split(", ");
+    expect(listed).toContain("uninstall");
+    for (const alias of ["start", "up", "on", "list", "add-relay"]) expect(listed).not.toContain(alias);
+  });
+  test("W8 constructor is unknown, not a removed prototype key", async () => {
+    const text = warning(await act("constructor"));
+    expect(text).toContain('Unknown subcommand "constructor"'); expect(text).not.toContain("was removed");
+  });
+  test.each([["daemon", "/remote-pi daemon start"], ["stop now", "/remote-pi stop"], ["status x", "/remote-pi status"]])("W9 invalid form %s lists valid forms", async (args, form) => {
+    const text = warning(await act(args)); expect(text).toContain("is not a valid form — nothing was run.");
+    expect(text).toContain("Try:"); expect(text).toContain(form); expect(text).not.toContain("Did you mean");
+    expect(events()[0]?.reason).toBe("unknown_args");
+  });
+  test("W10 bare remote-pi still runs root with no command event", async () => {
+    await act(""); expect(events()[0]?.event).toBe("root_begin"); expect(_getLockedNameForTest()).not.toBeNull();
+    expect(events().some(e => e.event === "command")).toBe(false);
+  });
+  test.each([["statu", "status"], ["Status", "status"], ["sta", "status"], ["stp", "stop"], ["pari", "pair"], ["instal", "install"], ["d", null], ["xyzzy", null], ["help", null], ["", null]])("W11 suggest %s → %s", (input, expected) => {
+    expect(_suggestVerb(input!, ["setup", "status", "stop", "pair", "devices", "revoke", "rename", "set-relay", "relay", "config", "peers", "create", "remove", "daemons", "daemon", "cron", "install", "uninstall"])).toBe(expected);
+  });
+  test("W12 completions remain exactly canonical 33 entries", async () => {
+    type Complete = (prefix: string) => Array<{ value: string; label: string }>;
+    let complete!: Complete;
+    const { pi } = makeMockPi();
+    pi.registerCommand = ((name: string, opts: { getArgumentCompletions?: Complete }) => {
+      if (name === "remote-pi") complete = opts.getArgumentCompletions!;
+    }) as ExtensionAPI["registerCommand"];
+    (extension as ExtensionFactory)(pi);
+    expect((await complete("")).map(c => c.value)).toEqual([
+      "setup", "status", "stop", "pair", "devices", "revoke", "rename", "set-relay",
+      "relay", "relay start", "relay stop", "relay status", "relay url", "config", "peers",
+      "create", "remove", "daemons", "daemon start", "daemon stop", "daemon restart", "daemon send", "daemon status",
+      "cron", "cron add", "cron list", "cron remove", "cron enable", "cron disable", "cron run", "cron log", "install", "uninstall",
+    ]);
+    expect((await complete("st")).map(c => c.value)).toEqual(["status", "stop"]);
   });
 });

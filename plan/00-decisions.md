@@ -76,6 +76,7 @@ Numeração `00-` é proposital: este arquivo carrega antes dos planos numerados
 | **Rename apenas do pareamento** | Local no Keychain/Keystore do mobile. Nome default = cwd onde o Pi rodou (ex: `remote_pi · feature/protocol`). Sem 3 níveis. |
 | **Trabalho paralelo** | Emerge da arquitetura: N Pi processes pareados = N sessões no app. App mostra todas com swipe entre elas |
 | **Switcher por gesto** | Recomendação UX: swipe da borda esquerda alterna entre últimos N pareamentos |
+| **Verbos legados de `/remote-pi` são alias, nunca no-op silencioso (fechado 2026-10-14 — plano 70)** | `start`/`up`/`on` → root; `list` → `devices`; `add-relay <url>` → `set-relay`; `join`/`leave`/`sessions` → aviso "removido" com o substituto; verbo desconhecido → aviso + sugestão, **nunca** roda o root (só `/remote-pi` sem argumentos roda). Precedente: #119/`e55dcdd` (família `relay`); alternativa rejeitada: só corrigir a doc |
 
 ## Approval / segurança operacional
 

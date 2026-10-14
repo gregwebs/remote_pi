@@ -6,7 +6,7 @@
  *   pi -e $(pwd)/dist/index.js
  *
  * State machine:  idle → started → paired
- *   /remote-pi start   connects to relay (idle → started)
+ *   /remote-pi         joins local mesh + connects to relay (idle → started); legacy alias: start/up/on
  *   /remote-pi pair    shows QR for new peers (started, async → paired via auto-listener)
  *   /remote-pi stop    closes everything (any → idle)
  *
@@ -93,7 +93,7 @@ import {
   sessionSockPath,
   skillsDir,
 } from "./session/global_config.js";
-import { acquireCwdLock, type AcquiredLock } from "./session/cwd_lock.js";
+import { acquireCwdLock, type AcquiredLock, type CwdLockResult } from "./session/cwd_lock.js";
 import { addDaemon, listDaemons, removeDaemon } from "./daemon/registry.js";
 import { callSupervisor, supervisorOnline, SupervisorOfflineError } from "./daemon/client.js";
 import type { ControlRequest, DaemonInfo } from "./daemon/control_protocol.js";
@@ -106,6 +106,10 @@ import {
   localConfigExists,
   saveLocalConfig,
 } from "./session/local_config.js";
+import {
+  classifyRootEnd, errorText, formatRootOutcomeLine, lastRootOutcome,
+  recordLifecycle, type AutoInitSkipReason,
+} from "./session/root_diagnostics.js";
 import { runSetupWizard, type WizardUI } from "./session/setup_wizard.js";
 import { updateFooter, type FooterState } from "./ui/footer.js";
 import { join, dirname, resolve } from "node:path";
@@ -996,6 +1000,7 @@ export function _resetAutoInitedForTest(): void { _autoInited = false; }
 export function _setAutoInitedForTest(value: boolean): void { _autoInited = value; }
 
 /** Test-only: true when this instance holds a live local-mesh node. */
+export function _getRootInFlightForTest(): Promise<void> | null { return _cmdRootInFlight; }
 export function _hasMeshNodeForTest(): boolean { return _meshNode !== null; }
 
 /** Test-only: drive the current real SelfRevoke producer through one sweep. */
@@ -2068,6 +2073,101 @@ function _appliedRegistry(): WeakSet<object> {
   return (g[_APPLIED_REGISTRY_KEY] ??= new WeakSet<object>());
 }
 
+// Canonical autocomplete/list/suggestion source (plan/70 A2).
+// Legacy aliases are compatibility, deliberately not part of this surface.
+const _REMOTE_PI_SUBCOMMANDS: readonly string[] = [
+  "setup", "status", "stop",
+  "pair", "devices", "revoke",
+  "rename",
+  "set-relay",
+  "relay", "relay start", "relay stop", "relay status", "relay url",
+  "config",
+  "peers",  // plan/25 Wave D — local + cross-PC inventory
+  "create", "remove", "daemons",  // daemon registry (plan/26 W1)
+  // Fleet ops use the `daemon` prefix so `/remote-pi stop` keeps
+  // meaning "stop this local Pi" — the local UX shipped in plan/25.
+  "daemon start", "daemon stop", "daemon restart",
+  "daemon send", "daemon status",
+  "cron", "cron add", "cron list", "cron remove", "cron enable", "cron disable", "cron run", "cron log",
+  "install", "uninstall",  // service install (plan/26 W3)
+];
+/** First tokens, deduped in order. */
+const _REMOTE_PI_VERBS: readonly string[] =
+  [...new Set(_REMOTE_PI_SUBCOMMANDS.map((o) => o.split(" ", 1)[0] ?? o))];
+
+// Verbs dropped in the 2026-05-23 surface cut (see the comment above
+// `registerCommand("remote-pi")`). A Map, not an object literal, so
+// "constructor"/"toString" can't match through the prototype.
+const _REMOVED_VERBS: ReadonlyMap<string, string> = new Map([
+  ["join",     `"/remote-pi join" was removed — the local mesh is a single session now. Use /remote-pi to join it.`],
+  ["leave",    `"/remote-pi leave" was removed. Use /remote-pi stop to leave the mesh and disconnect the relay.`],
+  ["sessions", `"/remote-pi sessions" was removed — there is one local session. Use /remote-pi peers to see who is on it.`],
+]);
+
+/**
+ * plan/70 A2: closest known verb for a typo, or null. Unique prefix wins
+ * ("statu" → "status"); otherwise the nearest by edit distance when it is
+ * ≤ min(2, ⌊len/2⌋) (ties → list order). Exported for tests.
+ */
+export function _suggestVerb(input: string, candidates: readonly string[]): string | null {
+  const v = input.toLowerCase();
+  if (v === "") return null;
+  const byPrefix = candidates.filter((c) => c.startsWith(v));
+  if (byPrefix.length === 1) return byPrefix[0] ?? null;
+  const max = Math.min(2, Math.floor(v.length / 2));
+  let best: string | null = null;
+  let bestD = max + 1;
+  for (const c of candidates) {
+    const d = _levenshtein(v, c);
+    if (d < bestD) { best = c; bestD = d; }   // strict < keeps the first on ties
+  }
+  return best;
+}
+
+/** Classic two-row DP edit distance (insert/delete/substitute = 1). */
+function _levenshtein(a: string, b: string): number {
+  let prev = Array.from({ length: b.length + 1 }, (_, j) => j);
+  for (let i = 1; i <= a.length; i++) {
+    const cur = [i];
+    for (let j = 1; j <= b.length; j++) {
+      cur[j] = Math.min(
+        (prev[j] ?? 0) + 1,
+        (cur[j - 1] ?? 0) + 1,
+        (prev[j - 1] ?? 0) + (a[i - 1] === b[j - 1] ? 0 : 1),
+      );
+    }
+    prev = cur;
+  }
+  return prev[b.length] ?? 0;
+}
+
+/**
+ * plan/70 A2: the dispatcher's catch-all. Never runs the root: before this,
+ * any unrecognized `/remote-pi <x>` silently ran `_cmdRoot`.
+ */
+function _cmdUnknownVerb(sub: string, ctx: Pick<ExtensionContext, "ui">): void {
+  const verb = (sub.split(/\s+/, 1)[0] ?? "").slice(0, 40);
+  if (_REMOTE_PI_VERBS.includes(verb)) {
+    // Known verb, unrecognized arguments: show that verb's forms, not a "did you mean" that loops.
+    const forms = _REMOTE_PI_SUBCOMMANDS.filter((o) => o === verb || o.startsWith(`${verb} `));
+    recordLifecycle({ event: "command", verb, reason: "unknown_args" });
+    ctx.ui.notify(
+      `[remote-pi] "/remote-pi ${sub.slice(0, 60)}" is not a valid form — nothing was run.\n` +
+      `  Try: ${forms.map((f) => `/remote-pi ${f}`).join(", ")}`,
+      "warning",
+    );
+    return;
+  }
+  const suggestion = _suggestVerb(verb, _REMOTE_PI_VERBS);
+  recordLifecycle({ event: "command", verb, reason: "unknown_verb", ...(suggestion ? { detail: suggestion } : {}) });
+  ctx.ui.notify(
+    `[remote-pi] Unknown subcommand "${verb}" — nothing was run.` +
+    (suggestion ? ` Did you mean "/remote-pi ${suggestion}"?` : "") +
+    `\n  Run /remote-pi to connect and show status. Subcommands: ${_REMOTE_PI_VERBS.join(", ")}`,
+    "warning",
+  );
+}
+
 const extension: ExtensionFactory = (pi: ExtensionAPI): void => {
   const applied = _appliedRegistry();
   if (applied.has(pi)) return;  // this session's pi was already wired
@@ -2393,18 +2493,30 @@ const extension: ExtensionFactory = (pi: ExtensionAPI): void => {
       const isPrintMode =
         process.argv.includes("-p") || process.argv.includes("--print");
       const cwd = isDaemon ? process.cwd() : "cwd" in ctx ? ctx.cwd : undefined;
-      if (
-        !isPrintMode &&
-        cwd &&
-        localConfigExists(cwd) &&
-        effectiveAutoStartRelay(loadLocalConfig(cwd))
-      ) {
+      // plan/70 Wave 0: every gate decision is logged — a skipped auto-start used
+      // to be indistinguishable from a failed one ("⚪ not connected", no message).
+      const skipReason: AutoInitSkipReason | null =
+        isPrintMode ? "print_mode"
+        : !cwd ? "no_cwd"
+        : !localConfigExists(cwd) ? "no_local_config"
+        : !effectiveAutoStartRelay(loadLocalConfig(cwd)) ? "auto_start_relay_false"
+        : null;
+      if (skipReason === null) {
         _autoInited = true;
+        recordLifecycle({ event: "session_start_autoinit", decision: "start", cwd });
         const initCtx = isDaemon
           ? ({ ui: _headlessUi(), cwd: process.cwd() } as Pick<ExtensionContext, "ui" | "cwd">)
           : ctx;
         void _cmdRoot(initCtx);
+      } else {
+        recordLifecycle({
+          event: "session_start_autoinit", decision: "skip", reason: skipReason, cwd,
+          // no_cwd evidence for the deferred process.cwd() fallback decision (plan/70 D-a).
+          ...(skipReason === "no_cwd" ? { detail: _noCwdDetail() } : {}),
+        });
       }
+    } else {
+      recordLifecycle({ event: "session_start_autoinit", decision: "skip", reason: "already_inited" });
     }
   });
 
@@ -2494,28 +2606,14 @@ const extension: ExtensionFactory = (pi: ExtensionAPI): void => {
         const shortPrefix = prefix === "revoke" ? "" : prefix.slice("revoke ".length);
         return _shortidCompletions(shortPrefix, "revoke ");
       }
-      return [
-        "setup", "status", "stop",
-        "pair", "devices", "revoke",
-        "rename",
-        "set-relay",
-        "relay", "relay start", "relay stop", "relay status", "relay url",
-        "config",
-        "peers",  // plan/25 Wave D — local + cross-PC inventory
-        "create", "remove", "daemons",  // daemon registry (plan/26 W1)
-        // Fleet ops use the `daemon` prefix so `/remote-pi stop` keeps
-        // meaning "stop this local Pi" — the local UX shipped in plan/25.
-        "daemon start", "daemon stop", "daemon restart",
-        "daemon send", "daemon status",
-        "cron", "cron add", "cron list", "cron remove", "cron enable", "cron disable", "cron run", "cron log",
-        "install", "uninstall",  // service install (plan/26 W3)
-      ]
+      return _REMOTE_PI_SUBCOMMANDS
         .filter((o) => o.startsWith(prefix))
         .map((o) => ({ value: o, label: o }));
     },
     handler: async (args, ctx) => {
       _lastCtx = ctx;
       const sub = args.trim();
+      const verb = sub.split(/\s+/, 1)[0] ?? "";
       if      (sub === "")                       { await _cmdRoot(ctx); }
       else if (sub === "setup")                  { await _cmdSetup(ctx); }
       else if (sub === "status")                 { _cmdStatus(ctx); }
@@ -2539,7 +2637,27 @@ const extension: ExtensionFactory = (pi: ExtensionAPI): void => {
       else if (sub === "cron" || sub.startsWith("cron ")) { await _cmdCron(sub.slice("cron".length).trim(), ctx); }
       else if (sub === "install")                { _cmdInstall(ctx, { linkCli: true }); }
       else if (sub === "uninstall")              { _cmdUninstall(ctx, { linkCli: true }); }
-      else                                       { await _cmdRoot(ctx); }
+      // plan/70 A1: legacy verbs from old docs/plans. Before this, each one fell
+      // into the catch-all below and silently ran the root (or nothing visible).
+      else if (verb === "start" || verb === "up" || verb === "on") {
+        recordLifecycle({ event: "command", verb, reason: "alias_of_root" });
+        await _cmdRoot(ctx);
+      }
+      else if (verb === "list") {
+        recordLifecycle({ event: "command", verb, reason: "alias_of_devices" });
+        await _cmdList(ctx);
+      }
+      else if (verb === "add-relay") {
+        recordLifecycle({ event: "command", verb, reason: "alias_of_set_relay" });
+        _cmdSetRelay(sub.slice("add-relay".length).trim(), ctx);
+      }
+      else if (_REMOVED_VERBS.has(verb)) {
+        recordLifecycle({ event: "command", verb, reason: "removed_verb" });
+        ctx.ui.notify(`[remote-pi] ${_REMOVED_VERBS.get(verb) ?? ""}`, "warning");
+      }
+      // plan/70 A2: anything else warns and runs NOTHING. Only bare `/remote-pi`
+      // (first branch) runs the root.
+      else                                       { _cmdUnknownVerb(sub, ctx); }
     },
   });
 
@@ -2606,13 +2724,17 @@ export default extension;
 // ── Command implementations ───────────────────────────────────────────────────
 
 /**
- * `/remote-pi status` — full state snapshot. Two lines: local mesh + relay.
+ * `/remote-pi status` — two lines, plus last-start when not all 🟢 and recorded.
+ * Inner root status suppresses this line until finalization.
  *
  * Always callable; safe when nothing is up (renders the off variants).
  * Reuses the same icons as the footer so terminal + status output stay
  * visually consistent.
  */
-function _cmdStatus(ctx: Pick<ExtensionContext, "ui">): void {
+function _cmdStatus(
+  ctx: Pick<ExtensionContext, "ui">,
+  opts: { lastStart?: boolean } = {},
+): void {
   const relayUrl = _relayUrl ?? resolveRelayUrl().url;
 
   // Mesh line
@@ -2638,7 +2760,15 @@ function _cmdStatus(ctx: Pick<ExtensionContext, "ui">): void {
       : `🟡 Relay: on, waiting for first pairing (${relayUrl})`;
   }
 
-  ctx.ui.notify(`[remote-pi]\n  ${meshLine}\n  ${relayLine}`, "info");
+  // plan/70: include yellow waiting-for-first-pairing, not only off states.
+  const lines = [meshLine, relayLine];
+  const outcome = lastRootOutcome();
+  const notAllGreen = _meshNode === null || _state === "idle"
+    || (_activePeers.size === 0 && !_hasGlobalPairings);
+  if (opts.lastStart !== false && outcome && notAllGreen) {
+    lines.push(formatRootOutcomeLine(outcome, Date.now()));
+  }
+  ctx.ui.notify(`[remote-pi]\n  ${lines.join("\n  ")}`, "info");
 }
 
 /**
@@ -2668,6 +2798,69 @@ async function _cmdPeers(ctx: Pick<ExtensionContext, "ui">): Promise<void> {
   ctx.ui.notify(`[remote-pi] peers:\n${formatPeerInventory(peers, selfName)}`, "info");
 }
 
+function _noCwdDetail(): string {
+  try {
+    const pcwd = process.cwd();
+    return `process.cwd()=${pcwd} has_config=${localConfigExists(pcwd)}`;
+  } catch {
+    return "process.cwd()=<unavailable>";
+  }
+}
+
+interface _RootDiagnosticsContext { cwd?: string; configExists?: boolean; autoStartRelay?: boolean }
+
+/** plan/70: finally diagnostics must never replace the original rejection. */
+function _recordRootEnd(
+  diagnostics: _RootDiagnosticsContext,
+  generation: number,
+  failure: { value: unknown } | undefined,
+): void {
+  try {
+    const cwd = diagnostics.cwd;
+    const { result, reason, detail } = classifyRootEnd({
+      ...(failure ? { error: failure } : {}),
+      lifecycleCurrent: _isCurrentRootLifecycle(generation),
+      lockHeld: _cwdLock !== null,
+      configExists: diagnostics.configExists ?? false,
+      autoStartRelay: diagnostics.autoStartRelay ?? false,
+      meshJoined: _meshNode !== null,
+      relayStarted: _state !== "idle",
+    });
+    recordLifecycle({
+      event: "root_end", generation, cwd, result, reason,
+      ...(detail ? { detail } : {}),
+      ...(_lockedName ? { name: _lockedName } : {}),
+      ...(_myRoomId ? { room: _myRoomId } : {}),
+    });
+  } catch { /* diagnostics are best-effort */ }
+}
+
+/** plan/70: publication determines step success; no child-command edits. */
+function _recordRootStepEnd(
+  step: "join" | "relay_connect", generation: number, diagnostics: _RootDiagnosticsContext,
+): void {
+  const ok = step === "join" ? _meshNode !== null : _state !== "idle";
+  recordLifecycle({
+    event: step === "join" ? "join_end" : "relay_connect_end",
+    generation, cwd: diagnostics.cwd,
+    result: ok ? "ok" : _isCurrentRootLifecycle(generation) ? "failed" : "stale",
+    ...(ok ? {} : { reason: step === "join" ? "join_not_published" : "relay_not_started" }),
+  });
+}
+
+/** plan/70: log actual attempted candidate/path, not a synthetic owner detail. */
+function _recordRootLockResult(
+  cwd: string, name: string, generation: number, result: CwdLockResult,
+): void {
+  try {
+    recordLifecycle({
+      event: "lock_result", generation, cwd, name,
+      result: result.ok ? "ok" : "refused",
+      lockPath: result.lockPath,
+    });
+  } catch { /* diagnostics must not change lock publication */ }
+}
+
 /**
  * Root handler for `/remote-pi`. On first run (no local config) drops into
  * the wizard; on subsequent runs auto-joins the local mesh + starts the
@@ -2684,9 +2877,13 @@ async function _cmdRoot(
     ?? _rootLifecycleGeneration;
 
   if (_cmdRootInFlight) {
+    // plan/70: an unmatched wait_begin reveals the existing H1 wedge.
+    recordLifecycle({ event: "root_wait_begin", generation: rootLifecycleGeneration });
     try {
       await _cmdRootInFlight;
+      recordLifecycle({ event: "root_wait_end", generation: rootLifecycleGeneration, result: "ok" });
     } catch (err) {
+      recordLifecycle({ event: "root_wait_end", generation: rootLifecycleGeneration, result: "failed", detail: errorText(err) });
       // Stale authority stops here. A current normal duplicate preserves the
       // outgoing error, while a current replacement suppresses that old-session
       // failure and falls through to start one fresh root below.
@@ -2701,19 +2898,29 @@ async function _cmdRoot(
   }
 
   if (!_isCurrentRootLifecycle(rootLifecycleGeneration)) return;
-
-  const run = _cmdRootInner(ctx, rootLifecycleGeneration);
+  const diagnostics: _RootDiagnosticsContext = {};
+  recordLifecycle({
+    event: "root_begin", generation: rootLifecycleGeneration,
+    ...(restartAuthority ? { restart: true } : {}),
+  });
+  const run = _cmdRootInner(ctx, rootLifecycleGeneration, diagnostics);
   _cmdRootInFlight = run;
+  let failure: { value: unknown } | undefined;
   try {
     await run;
+  } catch (err) {
+    failure = { value: err };
+    throw err; // same rejection value/identity
   } finally {
-    if (_cmdRootInFlight === run) _cmdRootInFlight = null;
+    if (_cmdRootInFlight === run) _cmdRootInFlight = null; // unchanged; still first
+    _recordRootEnd(diagnostics, rootLifecycleGeneration, failure);
   }
 }
 
 async function _cmdRootInner(
   ctx: Pick<ExtensionContext, "ui" | "cwd">,
   rootLifecycleGeneration: number,
+  diagnostics: _RootDiagnosticsContext,
 ): Promise<void> {
   // A root retains its startup epoch through every pre-candidate await. This is
   // stronger than `_disposed`, which a same-module session_start intentionally
@@ -2721,6 +2928,7 @@ async function _cmdRootInner(
   if (!_isCurrentRootLifecycle(rootLifecycleGeneration)) return;
 
   const cwd = "cwd" in ctx ? (ctx as ExtensionCommandContext).cwd : process.cwd();
+  diagnostics.cwd = cwd; // plan/70: capture only the authoritative lookup.
   // Lock identity is (cwd, name). Several agents may run in the SAME folder; the
   // requested name just has to be made unique. Derive the name the same way
   // `_cmdJoin` does so the lock and the mesh registration agree on identity.
@@ -2742,6 +2950,7 @@ async function _cmdRootInner(
         }
         return;
       }
+      _recordRootLockResult(cwd, candidate, rootLifecycleGeneration, result);
       if (result.ok) { _cwdLock = result; _lockedName = candidate; break; }
     }
     if (_cwdLock === null) {
@@ -2760,7 +2969,7 @@ async function _cmdRootInner(
   if (!localConfigExists(cwd)) {
     const ui = ctx.ui as unknown as WizardUI;
     if (typeof ui.select !== "function") {
-      _cmdStatus(ctx);
+      _cmdStatus(ctx, { lastStart: false });
       return;
     }
     const baseDefault = defaultAgentName(cwd);
@@ -2774,16 +2983,26 @@ async function _cmdRootInner(
       return;
     }
     saveLocalConfig(cwd, newConfig);
+    // plan/70: reuse config facts; finalization must not perform another lookup.
+    diagnostics.configExists = true;
+    diagnostics.autoStartRelay = effectiveAutoStartRelay(newConfig);
     ctx.ui.notify(
       `[remote-pi] Config saved to ${cwd}/.pi/remote-pi/config.json`,
       "info",
     );
     if (!_isCurrentRootLifecycle(rootLifecycleGeneration)) return;
+    // plan/70: bracket child commands without changing their returns/awaits.
+    recordLifecycle({ event: "join_begin", generation: rootLifecycleGeneration, cwd });
     await _cmdJoin(ctx);
+    _recordRootStepEnd("join", rootLifecycleGeneration, diagnostics);
     if (!_isCurrentRootLifecycle(rootLifecycleGeneration) || !_meshNode) return;
-    if (effectiveAutoStartRelay(newConfig)) await _cmdStart(ctx);
+    if (effectiveAutoStartRelay(newConfig)) {
+      recordLifecycle({ event: "relay_connect_begin", generation: rootLifecycleGeneration, cwd });
+      await _cmdStart(ctx);
+      _recordRootStepEnd("relay_connect", rootLifecycleGeneration, diagnostics);
+    }
     if (!_isCurrentRootLifecycle(rootLifecycleGeneration) || !_meshNode) return;
-    _cmdStatus(ctx);
+    _cmdStatus(ctx, { lastStart: false });
     return;
   }
 
@@ -2793,14 +3012,26 @@ async function _cmdRootInner(
   // the field's documented intent) — previously a false flag skipped the mesh
   // join entirely, leaving the agent (incl. daemons) fully idle.
   const config = loadLocalConfig(cwd);
+  // plan/70: capture existing facts without extra filesystem reads.
+  diagnostics.configExists = true;
+  diagnostics.autoStartRelay = effectiveAutoStartRelay(config);
   if (!_isCurrentRootLifecycle(rootLifecycleGeneration)) return;
-  if (!_meshNode) await _cmdJoin(ctx);
+  // plan/70: publication is observed only at these existing call sites.
+  if (!_meshNode) {
+    recordLifecycle({ event: "join_begin", generation: rootLifecycleGeneration, cwd });
+    await _cmdJoin(ctx);
+    _recordRootStepEnd("join", rootLifecycleGeneration, diagnostics);
+  }
   // `_cmdJoin` returns void on a canceled/failed join, so recheck both the
   // root lifecycle and publication before bringing the Relay up.
   if (!_isCurrentRootLifecycle(rootLifecycleGeneration) || !_meshNode) return;
-  if (effectiveAutoStartRelay(config) && _state === "idle") await _cmdStart(ctx);
+  if (effectiveAutoStartRelay(config) && _state === "idle") {
+    recordLifecycle({ event: "relay_connect_begin", generation: rootLifecycleGeneration, cwd });
+    await _cmdStart(ctx);
+    _recordRootStepEnd("relay_connect", rootLifecycleGeneration, diagnostics);
+  }
   if (!_isCurrentRootLifecycle(rootLifecycleGeneration) || !_meshNode) return;
-  _cmdStatus(ctx);
+  _cmdStatus(ctx, { lastStart: false });
 }
 
 /**
@@ -3250,7 +3481,7 @@ async function _cmdRevoke(arg: string, ctx: Pick<ExtensionContext, "ui" | "cwd">
   const shortid = arg.trim();
   if (!shortid) {
     ctx.ui.notify(
-      "[remote-pi] Usage: /remote-pi revoke <shortid>. Run /remote-pi list to see shortids.",
+      "[remote-pi] Usage: /remote-pi revoke <shortid>. Run /remote-pi devices to see shortids.",
       "warning",
     );
     return;
