@@ -108,8 +108,10 @@ import {
 } from "./session/local_config.js";
 import {
   classifyRootEnd, errorText, formatRootOutcomeLine, lastRootOutcome,
-  recordLifecycle, type AutoInitSkipReason,
+  recordLifecycle, allocateOutcomeId, identityRoom, formatLockFallbackLine, type StepOutcome, type LockFallback, type AutoInitSkipReason,
 } from "./session/root_diagnostics.js";
+import { rootDeadlines, settle, settleWithin, ConnectTimeoutError } from "./session/root_deadlines.js";
+import { withStartAttempt, type StartAttempt } from "./session/start_attempt.js";
 import { runSetupWizard, type WizardUI } from "./session/setup_wizard.js";
 import { updateFooter, type FooterState } from "./ui/footer.js";
 import { join, dirname, resolve } from "node:path";
@@ -249,6 +251,7 @@ let _meshJoinGeneration = 0;
 // relay/mesh generations below permanently distinguish the old candidates from
 // that replacement lifecycle even after `_disposed` becomes false again.
 let _disposed = false;
+let _sessionEpoch = 0;
 // True once the auto-init has run on the first session_start for this
 // process. Prevents re-running on session replacements (those re-init via
 // the _disposed re-arm path above). The session_start handler below auto-starts
@@ -978,8 +981,8 @@ function _maybeDrainQueuedItem(): void {
  */
 export async function _connectForTest(ctx: unknown): Promise<void> {
   const real = ctx as Parameters<typeof _cmdJoin>[0];
-  await _cmdJoin(real);
-  await _cmdStart(real);
+  await _runJoin(real);
+  await _runStart(real);
 }
 
 /** Test-only: tear everything down (mirrors `/remote-pi stop`). */
@@ -1016,6 +1019,8 @@ export function _resetCwdLockForTest(): void {
   try { _cwdLock?.release(); } catch { /* ignored */ }
   _cwdLock = null;
   _lockedName = null;
+  _reservedFallback = null;
+  _publishedFallback = null;
 }
 
 /**
@@ -1025,7 +1030,7 @@ export function _resetCwdLockForTest(): void {
  * agent-network broker).
  */
 export async function _startRelayForTest(ctx: unknown): Promise<void> {
-  await _cmdStart(ctx as Parameters<typeof _cmdStart>[0]);
+  await _runStart(ctx as Parameters<typeof _cmdStart>[0]);
 }
 
 /** Test-only: public marker for canceled-keypair cache regression checks. */
@@ -1165,6 +1170,16 @@ let _rootLifecycleGeneration = 0;
 // Coalesces concurrent `/remote-pi` startup paths inside ONE extension instance.
 // Separate Pi processes still keep the existing #N behavior via the cwd lock.
 let _cmdRootInFlight: Promise<void> | null = null;
+type CommandOrigin = "auto" | "user";
+interface RootRunRecord {
+  id: number; generation: number; sessionEpoch: number; since: number;
+  run?: Promise<void>; settled?: boolean; diagnostics: _RootDiagnosticsContext;
+}
+let _latestRoot: RootRunRecord | null = null;
+interface ReservedFallback { requested: string; reserved: string; ownerLockPath: string; lockPath: string }
+interface PublishedFallback extends LockFallback { node: MeshNode; canonicalTarget: string; defaultName: string }
+let _reservedFallback: ReservedFallback | null = null;
+let _publishedFallback: PublishedFallback | null = null;
 
 type RootRestartAuthority = Readonly<{
   rootLifecycleGeneration: number;
@@ -1656,6 +1671,30 @@ function _headlessUi(): { notify: (msg: string, type?: "info" | "warning" | "err
 }
 
 /**
+ * True when the command ctx has no interactive UI to drive the setup wizard.
+ *
+ * Two distinct shapes reach this:
+ *   1. The SDK's print-mode UI (`pi -p`) — `noOpUIContext`: `select`/`input` are
+ *      *defined* stubs (async () => undefined) and `notify` is a no-op, so a
+ *      `typeof select === "function"` probe cannot see it. `ctx.hasUI` is
+ *      false there, which is the reliable signal.
+ *   2. Our own headless ctxs (`_headlessUi()`): no `select` at all and no
+ *      `hasUI` field; they rely on the `select` probe as before.
+ * Interactive and RPC sessions expose a real `hasUI === true` and a real
+ * `select`, so they never match.
+ */
+function _hasNoInteractiveUi(ctx: Pick<ExtensionContext, "ui">): boolean {
+  const ui = ctx.ui as unknown as WizardUI;
+  return (ctx as { hasUI?: boolean }).hasUI === false || typeof ui.select !== "function";
+}
+
+/** Write a user-facing line to stderr for ctxs whose `notify` is a no-op
+ *  (the SDK's print-mode UI). Mirrors the warning channel in `_headlessUi()`. */
+function _writeStderr(message: string): void {
+  try { process.stderr.write(`${message}\n`); } catch { /* reporting must not mask the outcome */ }
+}
+
+/**
  * Handle a transparent control command from an RPC client (Cockpit), received
  * as a `CTRL_PREFIX`-tagged input the `input` hook swallowed. Toggles the relay
  * WITHOUT leaving the local mesh (relay-only: `_cmdStart` up / `_goIdle` down),
@@ -1672,7 +1711,7 @@ export async function _handleControl(cmd: string): Promise<void> {
   }
   switch (cmd) {
     case "relay:on":
-      if (_getState() === "idle") await _cmdStart(_controlCtx());
+      if (_getState() === "idle") await _runStart(_controlCtx());
       _emitRelayState(true);
       return;
     case "relay:off":
@@ -1684,7 +1723,7 @@ export async function _handleControl(cmd: string): Promise<void> {
       _emitRelayState(true);
       return;
     case "relay:toggle":
-      if (_getState() === "idle") await _cmdStart(_controlCtx());
+      if (_getState() === "idle") await _runStart(_controlCtx());
       else _goIdle("peer_stop");
       _emitRelayState(true);
       return;
@@ -1718,26 +1757,96 @@ async function _renameAgent(newName: string): Promise<void> {
   const cwd = process.cwd();
   saveLocalConfig(cwd, { agent_name: newName });
 
-  if (!_meshNode) {
+  const node = _meshNode;
+  if (!node) {
     // Not on the mesh yet — config persisted; applies on the next join.
+    return;
+  }
+
+  // plan/70 B1/F1: `SessionPeer.rename` tears the connection down BEFORE it
+  // awaits election/registration, so renaming to the name we already hold would
+  // destroy a valid registration only to re-establish the same one — and, on
+  // failure, leave the session unpublished for no reason. A same-name rename is
+  // therefore a genuine no-op: no teardown, no re-registration.
+  const currentName = node.name();
+  if (newName === currentName) {
+    ctx.ui.notify(`[remote-pi] already running as "${currentName}" on the local mesh — nothing to rename.`, "info");
     return;
   }
 
   // Relay room is derived from the name → cycle it so it follows. Tear down
   // first (also detaches the bridge) so the broker re-register below starts
   // clean; bring it back up after with the new name.
+  const epoch = _sessionEpoch;
+  const previousFallback = _refreshPublishedFallback();
+  const previousName = currentName;
+  // Reuse publication metadata; any canonicalization happens before rename awaits.
+  let canonicalTarget = previousFallback?.canonicalTarget ?? cwd;
+  if (!previousFallback) { try { canonicalTarget = realpathSync(cwd); } catch { /* raw cwd */ } }
+  const defaultName = previousFallback?.defaultName ?? defaultAgentName(cwd);
   const wasStarted = _getState() !== "idle";
   if (wasStarted) _goIdle("peer_stop");
 
-  let assigned = newName;
+  // plan/70 B1/F1+F2: the destructive rename below tears the mesh registration
+  // down before it awaits election/registration, so from the moment it begins
+  // this session has NO published identity. Capture this attempt's authority
+  // FIRST, then clear the single source of truth — the live `_meshNode` pointer
+  // plus its fallback — synchronously, before any await, so status/identity can
+  // never advertise a node that is mid-rename or already torn down. Clearing is
+  // ownership-conditional: another owner's node/fallback is never touched.
+  // Publication is re-established below only once the rename completed AND the
+  // registration is real (the broker-assigned name) AND this attempt still
+  // holds the captured authority; we never infer it from `name()` equality.
+  const authority = _publicationAuthority();
+  _unpublishOwnedNode(node);
+  _refreshFooter(ctx);
+
   try {
-    assigned = await _meshNode.rename(newName);  // broker soft rejoin
+    await node.rename(newName);  // broker soft rejoin
   } catch (err) {
-    ctx.ui.notify(`[remote-pi] rename failed: ${String(err)}`, "error");
+    // plan/70 B1/F1: stay unpublished. The failed rename really did tear the
+    // registration down; `node.name()` is only the requested name here, so it
+    // must never be treated as a surviving publication. Report the honest
+    // failure with an actionable next step, then release the torn-down node.
+    if (_sessionEpoch === epoch && !_disposed) {
+      ctx.ui.notify(`[remote-pi] rename failed: ${String(err)}`, "error");
+      if (_meshNode === null) {
+        ctx.ui.notify("[remote-pi] the local mesh was torn down by the failed rename and was NOT republished. Run /remote-pi to reconnect.", "warning");
+      }
+    }
+    try { await node.close(); } catch { /* best-effort quarantine */ }
+    return;
   }
 
-  if (wasStarted && !_disposed) await _cmdStart(ctx);  // relay back up → roomIdFor(cwd, assigned)
+  // The rename resolved, but publication must only be re-established while
+  // THIS attempt still holds the authority captured before the await. A `stop`
+  // (which cannot see the empty slot, but DOES advance the generations), relay
+  // off, session replacement, or a newer start/join revokes it; an empty
+  // `_meshNode` slot is not proof of retained ownership. Stay unpublished, tear
+  // down the now-orphaned registration so no live identity claim survives, and
+  // report the outcome honestly instead of claiming a publication that is not
+  // ours.
+  if (!_holdsPublicationAuthority(authority) || _meshNode !== null || _isNodeClosed(node)) {
+    _unpublishOwnedNode(node);
+    try { await node.close(); } catch { /* best-effort quarantine */ }
+    if (_sessionEpoch === epoch && !_disposed) {
+      ctx.ui.notify(`[remote-pi] rename to "${newName}" was NOT published: the session was stopped (or a newer start took over) while the rename was in flight. Run /remote-pi to reconfirm it.`, "warning");
+    }
+    return;
+  }
 
+  // The rename completed and the registration is real: re-publish THIS node.
+  _meshNode = node;
+  const assigned = node.name();
+  if (previousFallback) {
+    _publishedFallback = { ...previousFallback, effective: assigned, canonicalTarget, defaultName,
+      room: identityRoom(canonicalTarget, defaultName, assigned) };
+  }
+  if (wasStarted && !_disposed) await _runStart(ctx, _directScope("auto"));  // relay back up → roomIdFor(cwd, assigned)
+
+  if (_sessionEpoch !== epoch || _disposed || _meshNode !== node) return;
+  const updatedFallback = _refreshPublishedFallback();
+  if (updatedFallback && assigned !== previousName) _notifyFallback(ctx, updatedFallback);
   _pi?.sendMessage({
     customType: "remote-pi:name-assigned",
     content: assigned === newName
@@ -2554,6 +2663,8 @@ const extension: ExtensionFactory = (pi: ExtensionAPI): void => {
     _rootLifecycleGeneration += 1;
     _relayLifecycleGeneration += 1;
     _meshJoinGeneration += 1;
+    _sessionEpoch += 1;
+    _publishedFallback = null;
     // The bridge owns live pi.events subscriptions + flow TTLs. Dispose before
     // the outgoing session is replaced so stale listeners cannot leak or
     // double-broadcast. session_start rebinds it on module-reuse hosts; fresh
@@ -2578,6 +2689,7 @@ const extension: ExtensionFactory = (pi: ExtensionAPI): void => {
 
     const meshNode = _meshNode;
     _meshNode = null;
+    _publishedFallback = null;
     _sessionName = null;
     _sessionPeerCount = 0;
     let meshClose: Promise<void> | null = null;
@@ -2587,6 +2699,7 @@ const extension: ExtensionFactory = (pi: ExtensionAPI): void => {
       try { _cwdLock.release(); } catch { /* best-effort */ }
       _cwdLock = null;
       _lockedName = null;
+      _reservedFallback = null;
     }
     try { await meshClose; } catch { /* best-effort */ }
   });
@@ -2614,7 +2727,7 @@ const extension: ExtensionFactory = (pi: ExtensionAPI): void => {
       _lastCtx = ctx;
       const sub = args.trim();
       const verb = sub.split(/\s+/, 1)[0] ?? "";
-      if      (sub === "")                       { await _cmdRoot(ctx); }
+      if      (sub === "")                       { await _cmdRoot(ctx, undefined, "user"); }
       else if (sub === "setup")                  { await _cmdSetup(ctx); }
       else if (sub === "status")                 { _cmdStatus(ctx); }
       else if (sub === "stop")                   { await _cmdStop(ctx); }
@@ -2641,7 +2754,7 @@ const extension: ExtensionFactory = (pi: ExtensionAPI): void => {
       // into the catch-all below and silently ran the root (or nothing visible).
       else if (verb === "start" || verb === "up" || verb === "on") {
         recordLifecycle({ event: "command", verb, reason: "alias_of_root" });
-        await _cmdRoot(ctx);
+        await _cmdRoot(ctx, undefined, "user");
       }
       else if (verb === "list") {
         recordLifecycle({ event: "command", verb, reason: "alias_of_devices" });
@@ -2762,6 +2875,8 @@ function _cmdStatus(
 
   // plan/70: include yellow waiting-for-first-pairing, not only off states.
   const lines = [meshLine, relayLine];
+  const fallback = _refreshPublishedFallback();
+  if (fallback) lines.push(formatLockFallbackLine(fallback) + (_matchingFallbackRelay(fallback) ? "" : " · Relay is off/not connected"));
   const outcome = lastRootOutcome();
   const notAllGreen = _meshNode === null || _state === "idle"
     || (_activePeers.size === 0 && !_hasGlobalPairings);
@@ -2807,58 +2922,292 @@ function _noCwdDetail(): string {
   }
 }
 
-interface _RootDiagnosticsContext { cwd?: string; configExists?: boolean; autoStartRelay?: boolean }
+interface _RootDiagnosticsContext {
+  cwd?: string; configExists?: boolean; autoStartRelay?: boolean;
+  stage?: string; id?: number; epoch?: number; origin?: CommandOrigin; configDetail?: string;
+  join?: ObservedStep; relay?: ObservedStep; statusShown?: boolean;
+  explanation?: Explanation; name?: string; room?: string;
+}
 
 /** plan/70: finally diagnostics must never replace the original rejection. */
 function _recordRootEnd(
   diagnostics: _RootDiagnosticsContext,
   generation: number,
   failure: { value: unknown } | undefined,
-): void {
-  try {
-    const cwd = diagnostics.cwd;
-    const { result, reason, detail } = classifyRootEnd({
-      ...(failure ? { error: failure } : {}),
-      lifecycleCurrent: _isCurrentRootLifecycle(generation),
-      lockHeld: _cwdLock !== null,
-      configExists: diagnostics.configExists ?? false,
-      autoStartRelay: diagnostics.autoStartRelay ?? false,
-      meshJoined: _meshNode !== null,
-      relayStarted: _state !== "idle",
-    });
-    recordLifecycle({
-      event: "root_end", generation, cwd, result, reason,
-      ...(detail ? { detail } : {}),
-      ...(_lockedName ? { name: _lockedName } : {}),
-      ...(_myRoomId ? { room: _myRoomId } : {}),
-    });
-  } catch { /* diagnostics are best-effort */ }
+): StepOutcome {
+  const current = diagnostics.epoch === _sessionEpoch && _isCurrentRootLifecycle(generation);
+  const outcome = classifyRootEnd({
+    ...(failure ? { error: failure } : {}),
+    lifecycleCurrent: current, disposed: _disposed,
+    lockHeld: _cwdLock !== null,
+    configExists: diagnostics.configExists ?? false,
+    configDetail: diagnostics.configDetail,
+    autoStartRelay: diagnostics.autoStartRelay ?? false,
+    meshJoined: _meshNode !== null, relayStarted: _state !== "idle",
+    join: diagnostics.join, relay: diagnostics.relay,
+  });
+  if (current && !failure && (!diagnostics.join || diagnostics.join.result === "ok")
+    && (!diagnostics.relay || diagnostics.relay.result === "ok")) {
+    try { diagnostics.name = _meshNode?.name() ?? diagnostics.name; } catch { /* retain owned snapshot */ }
+    diagnostics.room = _state !== "idle" ? _myRoomId ?? diagnostics.room : diagnostics.room;
+  }
+  recordLifecycle({ event: "root_end", outcomeId: diagnostics.id, generation,
+    cwd: diagnostics.cwd, ...outcome, name: diagnostics.name, room: diagnostics.room });
+  return outcome;
 }
 
-/** plan/70: publication determines step success; no child-command edits. */
 function _recordRootStepEnd(
   step: "join" | "relay_connect", generation: number, diagnostics: _RootDiagnosticsContext,
 ): void {
-  const ok = step === "join" ? _meshNode !== null : _state !== "idle";
+  const child = step === "join" ? diagnostics.join : diagnostics.relay;
+  const ok = child ? child.result === "ok" : step === "join" ? _meshNode !== null : _state !== "idle";
   recordLifecycle({
-    event: step === "join" ? "join_end" : "relay_connect_end",
+    event: step === "join" ? "join_end" : "relay_connect_end", outcomeId: diagnostics.id,
     generation, cwd: diagnostics.cwd,
     result: ok ? "ok" : _isCurrentRootLifecycle(generation) ? "failed" : "stale",
-    ...(ok ? {} : { reason: step === "join" ? "join_not_published" : "relay_not_started" }),
+    ...(ok ? { reason: child?.reason ?? (step === "join" ? "joined" : "relay_connected") } : { reason: child?.reason === "relay_timeout" ? "relay_timeout" : step === "join" ? "join_not_published" : "relay_not_started",
+      ...(child ? { detail: child.reason + (child.detail ? `: ${child.detail}` : "") } : {}) }),
   });
 }
 
 /** plan/70: log actual attempted candidate/path, not a synthetic owner detail. */
 function _recordRootLockResult(
-  cwd: string, name: string, generation: number, result: CwdLockResult,
+  cwd: string, name: string, generation: number, result: CwdLockResult, outcomeId?: number,
 ): void {
   try {
     recordLifecycle({
-      event: "lock_result", generation, cwd, name,
+      event: "lock_result", outcomeId, generation, cwd, name,
       result: result.ok ? "ok" : "refused",
       lockPath: result.lockPath,
     });
   } catch { /* diagnostics must not change lock publication */ }
+}
+
+function _rootScope(d: _RootDiagnosticsContext, generation: number): StepScope {
+  return { id: d.id!, generation, epoch: d.epoch ?? _sessionEpoch, origin: d.origin ?? "auto", root: true, diagnostics: d };
+}
+type CommandCtx = Pick<ExtensionContext, "ui" | "cwd">;
+type Explanation = { message: string; level: "info" | "warning" | "error" };
+interface ObservedStep extends StepOutcome {
+  explanation?: Explanation;
+  publication?: { node?: MeshNode; name?: string; room?: string };
+}
+interface StepScope { id: number; generation: number; epoch: number; origin: CommandOrigin; root?: boolean; diagnostics?: _RootDiagnosticsContext }
+function _staleMessage(head: string, reason: string): string {
+  return reason === "disposed"
+    ? `[remote-pi] ${head} did nothing: this pi session is holding a stale remote-pi instance (reason=disposed). Run /reload (or restart pi) to get a fresh one.`
+    : `[remote-pi] ${head} was cancelled before it finished (reason=lifecycle_superseded): stop, relay off, session change or a newer start took over. Run /remote-pi status; if this keeps happening, run /reload (or restart pi).`;
+}
+function _notifyInvocation(ctx: Pick<ExtensionContext, "ui">, message: string, level: Explanation["level"]): void {
+  try { ctx.ui.notify(message, level); } catch { /* best-effort reporting must preserve rejection */ }
+}
+function _matchingFallbackRelay(f: PublishedFallback): boolean {
+  return _state !== "idle" && _relay !== null && _myRoomMeta?.name === f.effective && _myRoomId !== null;
+}
+/**
+ * plan/70 B1/G1: the publication AUTHORITY for a destructive, awaited rename.
+ *
+ * An empty `_meshNode` slot does NOT prove that an in-flight rename still owns
+ * the publication: `_unpublishOwnedNode` clears the slot *before* the rename
+ * awaits, so a `stop` issued in that window sees nothing to clear and (in the
+ * mesh-only case) answers "Already stopped". The rename must therefore carry
+ * its own proof of retained authority across the await. Every invalidation site
+ * advances at least one of these counters:
+ *   - `stop`              → root + mesh + relay generations
+ *   - relay off / `_goIdle` → root + relay generations
+ *   - `session_shutdown`  → root + mesh + relay generations + epoch
+ *   - a newer start       → relay generation (`_cmdStart`)
+ *   - a newer join/root   → mesh generation (`_cmdJoin`)
+ * `_disposed` is checked live (it only clears on a same-module `session_start`).
+ */
+type PublicationAuthority = Readonly<{
+  rootLifecycleGeneration: number;
+  meshJoinGeneration: number;
+  relayLifecycleGeneration: number;
+  sessionEpoch: number;
+}>;
+function _publicationAuthority(): PublicationAuthority {
+  return {
+    rootLifecycleGeneration: _rootLifecycleGeneration,
+    meshJoinGeneration: _meshJoinGeneration,
+    relayLifecycleGeneration: _relayLifecycleGeneration,
+    sessionEpoch: _sessionEpoch,
+  };
+}
+function _holdsPublicationAuthority(a: PublicationAuthority): boolean {
+  return !_disposed
+    && _sessionEpoch === a.sessionEpoch
+    && _rootLifecycleGeneration === a.rootLifecycleGeneration
+    && _meshJoinGeneration === a.meshJoinGeneration
+    && _relayLifecycleGeneration === a.relayLifecycleGeneration;
+}
+/** `closed` is private on MeshNode; tests read it the same way. */
+function _isNodeClosed(node: MeshNode): boolean {
+  return (node as unknown as { closed?: boolean }).closed === true;
+}
+/**
+ * plan/70 B1: the SINGLE place an owned node's publication is torn down. The
+ * live `_meshNode` pointer and its `_publishedFallback` are the source of truth
+ * for what status/identity may advertise; if either still points at `node`, it
+ * is cleared. Ownership-conditional, so another owner's node/fallback is never
+ * clobbered.
+ */
+function _unpublishOwnedNode(node: MeshNode): void {
+  if (_meshNode === node) _meshNode = null;
+  if (_publishedFallback?.node === node) _publishedFallback = null;
+}
+function _refreshPublishedFallback(): PublishedFallback | null {
+  const f = _publishedFallback;
+  if (!f || _meshNode !== f.node || !_reservedFallback) return null;
+  f.effective = f.node.name();
+  f.room = _matchingFallbackRelay(f) ? _myRoomId! : identityRoom(f.canonicalTarget, f.defaultName, f.effective);
+  return f;
+}
+function _notifyFallback(ctx: Pick<ExtensionContext, "ui">, f: PublishedFallback): void {
+  const active = _matchingFallbackRelay(f);
+  _notifyInvocation(ctx, `[remote-pi] "${f.requested}" is already running in this folder (lock: ${f.ownerLockPath}). This session joined as "${f.effective}" (identity room ${f.room}) — a different identity: paired apps and peers see it as a separate agent (reason=lock_suffixed). To use "${f.requested}" here, quit the other Pi, then run /reload.${active ? "" : " Relay is off/not connected."}`, "warning");
+}
+async function _runJoin(ctx: CommandCtx, scope?: StepScope): Promise<ObservedStep> {
+  const own = scope ?? { id: allocateOutcomeId(), generation: _rootLifecycleGeneration, epoch: _sessionEpoch, origin: "auto" as const };
+  let outcome: ObservedStep = { result: "failed", reason: "exception" };
+  if (!own.root) recordLifecycle({ event: "join_attempt_begin", outcomeId: own.id, generation: own.generation });
+  try {
+    outcome = await _cmdJoin(ctx);
+    const fallback = _publishedFallback;
+    if (outcome.result === "ok" && outcome.reason === "joined" && fallback && fallback.node === outcome.publication?.node) {
+      recordLifecycle({ event: "lock_fallback", outcomeId: own.id, generation: own.generation,
+        name: outcome.publication?.name, room: outcome.publication?.room, lockPath: fallback.ownerLockPath });
+    }
+    return outcome;
+  }
+  catch (error) {
+    outcome = { result: "failed", reason: "exception", detail: errorText(error) };
+    if (own.root && own.diagnostics) {
+      own.diagnostics.join = outcome;
+      _recordRootStepEnd("join", own.generation, own.diagnostics);
+    }
+    throw error;
+  }
+  finally {
+    if (!own.root) {
+      recordLifecycle({ event: "join_attempt_end", outcomeId: own.id, generation: own.generation, result: outcome.result, reason: outcome.reason, detail: outcome.detail });
+      if (own.epoch === _sessionEpoch) {
+        if (own.origin === "user" && outcome.result === "stale") _notifyInvocation(ctx, _staleMessage("/remote-pi", outcome.reason), "warning");
+        else if (outcome.result === "failed" && !outcome.explanation) _notifyInvocation(ctx, `[remote-pi] /remote-pi did not finish (reason=${outcome.reason}${outcome.detail ? `: ${outcome.detail}` : ""}). Run /remote-pi status.`, "warning");
+      }
+    }
+  }
+}
+
+function _directScope(origin: CommandOrigin): StepScope {
+  return { id: allocateOutcomeId(), generation: _rootLifecycleGeneration, epoch: _sessionEpoch, origin };
+}
+/** Preserve SDK class prototypes, lazy accessors and their original receivers. */
+function _observeCtx(ctx: CommandCtx, notify: (message: string, level?: string) => void): CommandCtx {
+  return new Proxy(ctx, {
+    get(target, key) {
+      const value = Reflect.get(target, key, target);
+      if (key === "ui") return new Proxy(value, {
+        get(ui, property) {
+          const method = Reflect.get(ui, property, ui);
+          if (property === "notify") return (message: string, level?: string) => {
+            method.call(ui, message, level);
+            notify(message, level);
+          };
+          return typeof method === "function" ? method.bind(ui) : method;
+        },
+      });
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  });
+}
+async function _runStart(ctx: CommandCtx, scope?: StepScope): Promise<ObservedStep> {
+  const own = scope ?? _directScope("auto");
+  let outcome: ObservedStep = { result: "failed", reason: "exception" };
+  let explanation: Explanation | undefined;
+  const notifications: Explanation[] = [];
+  let publication: object | null = null;
+  const attempt: StartAttempt = {};
+  if (!own.root) recordLifecycle({ event: "relay_start_begin", outcomeId: own.id, generation: own.generation });
+  try {
+    if (_disposed) return outcome = { result: "stale", reason: "disposed" };
+    const entryGeneration = _relayLifecycleGeneration;
+    const wasIdle = _state === "idle";
+    const observed = _observeCtx(ctx, (message, level) => {
+      const forwarded: Explanation = { message, level: level === "warning" || level === "error" ? level : "info" };
+      notifications.push(forwarded);
+      if (forwarded.level !== "info") explanation = forwarded;
+      if (message.includes("state: started") && message.includes("Connected to relay")) publication = _relay;
+    });
+    const pending = withStartAttempt(attempt, () => _cmdStart(observed));
+    const ownedGeneration = _relayLifecycleGeneration;
+    await pending;
+    // Ownership precedes ALL inference from mutable publication state.
+    if (own.epoch !== _sessionEpoch || _disposed || _relayLifecycleGeneration !== ownedGeneration
+      || (wasIdle && ownedGeneration !== entryGeneration + 1)) {
+      return outcome = { result: "stale", reason: _disposed ? "disposed" : "lifecycle_superseded" };
+    }
+    if (!wasIdle) return outcome = { result: "ok", reason: "already_started", explanation };
+    if (_state !== "idle" && _relay !== null && (attempt.candidate === _relay || publication === _relay)) {
+      return outcome = { result: "ok", reason: "relay_connected", publication: { name: _meshNode?.name(), room: _myRoomId ?? undefined } };
+    }
+    const transport = attempt.connectResult;
+    const timeout = transport?.result === "failed" && transport.error instanceof ConnectTimeoutError;
+    return outcome = { result: "failed", reason: timeout ? "relay_timeout" : !attempt.candidate && explanation?.level === "error" && !explanation.message.includes("relay connect failed") ? "identity_unavailable" : "relay_connect_failed",
+      detail: transport?.result === "failed" ? errorText(transport.error) : explanation?.message, explanation };
+  } catch (error) {
+    outcome = { result: "failed", reason: "exception", detail: errorText(error), explanation };
+    if (own.root && own.diagnostics) {
+      own.diagnostics.relay = outcome;
+      own.diagnostics.explanation = explanation;
+      _recordRootStepEnd("relay_connect", own.generation, own.diagnostics);
+    }
+    throw error;
+  } finally {
+    if (!own.root) {
+      recordLifecycle({ event: "relay_start_end", outcomeId: own.id, generation: own.generation,
+        result: outcome.result, reason: outcome.reason, detail: outcome.detail });
+      if (own.epoch === _sessionEpoch) {
+        if (own.origin === "user" && outcome.result === "stale") _notifyInvocation(ctx, _staleMessage("/remote-pi relay start", outcome.reason), "warning");
+        else if (outcome.result === "failed" && !outcome.explanation) _notifyInvocation(ctx, `[remote-pi] /remote-pi relay start did not finish (reason=${outcome.reason}${outcome.detail ? `: ${outcome.detail}` : ""}). Run /remote-pi status.`, "warning");
+      }
+    }
+  }
+}
+
+function _reportRootEnd(ctx: CommandCtx, d: _RootDiagnosticsContext, outcome: StepOutcome): void {
+  if (d.epoch !== _sessionEpoch) return;
+  if (d.origin === "user" && !d.statusShown) {
+    try { _cmdStatus(ctx, { lastStart: false }); d.statusShown = true; } catch { /* best-effort */ }
+  }
+  if (d.epoch !== _sessionEpoch) return;
+  if (outcome.result === "ok" || (outcome.result === "stale" && d.origin !== "user")) return;
+  if (outcome.result === "stale") {
+    _notifyInvocation(ctx, _staleMessage("/remote-pi", outcome.reason), "warning");
+    return;
+  }
+  if (d.explanation) return;
+  const hint = outcome.reason === "no_local_config" ? "Run /remote-pi in an interactive Pi terminal to set up this folder."
+    : outcome.reason === "join_not_published" ? "Run /remote-pi status, then retry /remote-pi."
+    : outcome.reason === "relay_not_started" || outcome.reason === "relay_timeout" ? "Check /remote-pi config, then run /remote-pi relay start."
+    : "Run /remote-pi status.";
+  _notifyInvocation(ctx, `[remote-pi] ${d.origin === "user" ? "/remote-pi" : "Auto-start"} did not finish (reason=${outcome.reason}${outcome.detail ? `: ${outcome.detail}` : ""}). ${hint}`, "warning");
+}
+function _reportRootBail(ctx: CommandCtx, generation: number, epoch: number, origin: CommandOrigin, id?: number): void {
+  const outcome: StepOutcome = { result: "stale", reason: _disposed ? "disposed" : "lifecycle_superseded" };
+  recordLifecycle({ event: "root_end", generation, outcomeId: id, ...outcome });
+  _reportRootEnd(ctx, { epoch, origin }, outcome);
+}
+function _notifyStillConnecting(ctx: CommandCtx, generation: number, epoch: number, record: RootRunRecord): void {
+  if (epoch !== _sessionEpoch || !_isCurrentRootLifecycle(generation) || _latestRoot !== record
+    || !_isCurrentRootLifecycle(record.generation) || record.sessionEpoch !== epoch || record.settled) return;
+  try { _cmdStatus(ctx, { lastStart: false }); } catch { /* best-effort */ }
+  // A status callback can synchronously invalidate this invocation too.
+  if (epoch !== _sessionEpoch || !_isCurrentRootLifecycle(generation) || _latestRoot !== record || record.settled) return;
+  const age = Math.max(0, Math.floor((Date.now() - record.since) / 1000));
+  const stage = record.diagnostics.stage
+    ?? (record.diagnostics.relay ? "connecting_relay" : record.diagnostics.join ? "joining_mesh" : "root_in_progress");
+  _notifyInvocation(ctx, `[remote-pi] Still connecting… (${age}s, ${stage}) — the previous /remote-pi has not finished yet. /remote-pi status shows progress; /remote-pi stop invalidates its startup authority.`, "warning");
 }
 
 /**
@@ -2872,48 +3221,84 @@ function _recordRootLockResult(
 async function _cmdRoot(
   ctx: Pick<ExtensionContext, "ui" | "cwd">,
   restartAuthority?: RootRestartAuthority,
+  origin: CommandOrigin = "auto",
 ): Promise<void> {
-  const rootLifecycleGeneration = restartAuthority?.rootLifecycleGeneration
-    ?? _rootLifecycleGeneration;
-
-  if (_cmdRootInFlight) {
-    // plan/70: an unmatched wait_begin reveals the existing H1 wedge.
-    recordLifecycle({ event: "root_wait_begin", generation: rootLifecycleGeneration });
-    try {
-      await _cmdRootInFlight;
-      recordLifecycle({ event: "root_wait_end", generation: rootLifecycleGeneration, result: "ok" });
-    } catch (err) {
-      recordLifecycle({ event: "root_wait_end", generation: rootLifecycleGeneration, result: "failed", detail: errorText(err) });
-      // Stale authority stops here. A current normal duplicate preserves the
-      // outgoing error, while a current replacement suppresses that old-session
-      // failure and falls through to start one fresh root below.
-      if (!_isCurrentRootLifecycle(rootLifecycleGeneration)) return;
-      if (!restartAuthority) throw err;
-    }
-    if (!_isCurrentRootLifecycle(rootLifecycleGeneration)) return;
-    if (!restartAuthority) {
-      _cmdStatus(ctx);
+  const generation = restartAuthority?.rootLifecycleGeneration ?? _rootLifecycleGeneration;
+  const epoch = _sessionEpoch;
+  if (!_isCurrentRootLifecycle(generation)) {
+    const active = _latestRoot && !_latestRoot.settled && _isCurrentRootLifecycle(_latestRoot.generation);
+    if (active) {
+      recordLifecycle({ event: "root_wait_end", outcomeId: _latestRoot!.id, generation, result: "stale", reason: "lifecycle_superseded" });
+      _reportRootEnd(ctx, { epoch, origin }, { result: "stale", reason: "lifecycle_superseded" });
+    } else _reportRootBail(ctx, generation, epoch, origin, allocateOutcomeId());
+    return;
+  }
+  const waitUntil = Date.now() + rootDeadlines().inFlightWaitMs;
+  let observed = _cmdRootInFlight || (_latestRoot && !_latestRoot.settled) ? _latestRoot : null;
+  while (observed) {
+    recordLifecycle({ event: "root_wait_begin", outcomeId: observed.id, generation });
+    if (!restartAuthority && !observed.settled && observed.generation === generation
+      && observed.sessionEpoch === epoch && Date.now() >= waitUntil) {
+      recordLifecycle({ event: "root_wait_end", outcomeId: observed.id, generation, result: "failed", reason: "still_connecting" });
+      if (origin === "user") _notifyStillConnecting(ctx, generation, epoch, observed);
       return;
     }
+    const result = observed.run
+      ? restartAuthority ? await settle(observed.run) : await settleWithin(observed.run, Math.max(0, waitUntil - Date.now()))
+      : { state: "pending" as const };
+    // Never use authority or owner snapshots made before the await for UI.
+    if (epoch !== _sessionEpoch || !_isCurrentRootLifecycle(generation)) {
+      recordLifecycle({ event: "root_wait_end", outcomeId: observed.id, generation, result: "stale", reason: _disposed ? "disposed" : "lifecycle_superseded" });
+      _reportRootEnd(ctx, { epoch, origin }, { result: "stale", reason: _disposed ? "disposed" : "lifecycle_superseded" });
+      return;
+    }
+    const latest = _latestRoot;
+    if (latest && latest !== observed) {
+      recordLifecycle({ event: "root_wait_end", outcomeId: observed.id, generation, result: "stale", reason: "lifecycle_superseded" });
+      observed = latest;
+      if (latest.settled && latest.sessionEpoch === epoch && latest.generation === generation) {
+        _cmdStatus(ctx);
+        return;
+      }
+      continue;
+    }
+    const ownerCurrent = observed.sessionEpoch === epoch && observed.generation === generation;
+    if (!ownerCurrent) {
+      recordLifecycle({ event: "root_wait_end", outcomeId: observed.id, generation, result: "stale", reason: "lifecycle_superseded" });
+      // No await from this comparison through fresh reservation below.
+      break;
+    }
+    if (result.state === "pending") {
+      recordLifecycle({ event: "root_wait_end", outcomeId: observed.id, generation, result: "failed", reason: "still_connecting" });
+      if (origin === "user") _notifyStillConnecting(ctx, generation, epoch, observed);
+      return;
+    }
+    recordLifecycle({ event: "root_wait_end", outcomeId: observed.id, generation,
+      result: result.state === "rejected" ? "failed" : "ok", ...(result.state === "rejected" ? { detail: errorText(result.error) } : {}) });
+    if (result.state === "rejected") {
+      try { _cmdStatus(ctx); } catch { /* preserve rejection */ }
+      if (epoch === _sessionEpoch) _notifyInvocation(ctx, `[remote-pi] /remote-pi did not finish (reason=exception: ${errorText(result.error)}). Run /remote-pi status.`, "warning");
+      throw result.error;
+    }
+    _cmdStatus(ctx);
+    return;
   }
 
-  if (!_isCurrentRootLifecycle(rootLifecycleGeneration)) return;
-  const diagnostics: _RootDiagnosticsContext = {};
-  recordLifecycle({
-    event: "root_begin", generation: rootLifecycleGeneration,
-    ...(restartAuthority ? { restart: true } : {}),
-  });
-  const run = _cmdRootInner(ctx, rootLifecycleGeneration, diagnostics);
+  const diagnostics: _RootDiagnosticsContext = { id: allocateOutcomeId(), epoch, origin };
+  const record: RootRunRecord = { id: diagnostics.id!, generation, sessionEpoch: epoch, since: Date.now(), diagnostics };
+  _latestRoot = record; // Atomic reservation: reentrant callers see an owner even before run exists.
+  recordLifecycle({ event: "root_begin", outcomeId: record.id, generation, ...(restartAuthority ? { restart: true } : {}) });
+  const run = _cmdRootInner(ctx, generation, diagnostics);
+  record.run = run;
   _cmdRootInFlight = run;
   let failure: { value: unknown } | undefined;
-  try {
-    await run;
-  } catch (err) {
-    failure = { value: err };
-    throw err; // same rejection value/identity
-  } finally {
-    if (_cmdRootInFlight === run) _cmdRootInFlight = null; // unchanged; still first
-    _recordRootEnd(diagnostics, rootLifecycleGeneration, failure);
+  try { await run; }
+  catch (err) { failure = { value: err }; throw err; }
+  finally {
+    if (_cmdRootInFlight === run) _cmdRootInFlight = null;
+    record.settled = true;
+    const outcome = _recordRootEnd(diagnostics, generation, failure);
+    _reportRootEnd(ctx, diagnostics, outcome);
   }
 }
 
@@ -2941,6 +3326,7 @@ async function _cmdRootInner(
   if (_cwdLock === null) {
     const isDaemon = process.env["REMOTE_PI_DAEMON"] === "1";
     const maxAttempts = isDaemon ? 1 : 1000;
+    let ownerLockPath: string | undefined;
     for (let n = 1; n <= maxAttempts; n++) {
       const candidate = n === 1 ? requestedName : `${requestedName}#${n}`;
       const result = await acquireCwdLock(cwd, candidate);
@@ -2950,17 +3336,21 @@ async function _cmdRootInner(
         }
         return;
       }
-      _recordRootLockResult(cwd, candidate, rootLifecycleGeneration, result);
-      if (result.ok) { _cwdLock = result; _lockedName = candidate; break; }
+      _recordRootLockResult(cwd, candidate, rootLifecycleGeneration, result, diagnostics.id);
+      if (!result.ok && ownerLockPath === undefined) ownerLockPath = result.lockPath;
+      if (result.ok) {
+        _cwdLock = result; _lockedName = candidate;
+        if (ownerLockPath) _reservedFallback = { requested: requestedName, reserved: candidate, ownerLockPath, lockPath: result.lockPath };
+        break;
+      }
     }
     if (_cwdLock === null) {
       if (!_isCurrentRootLifecycle(rootLifecycleGeneration)) return;
-      ctx.ui.notify(
-        process.env["REMOTE_PI_DAEMON"] === "1"
-          ? `[remote-pi] Daemon not started: another live agent already owns "${requestedName}" in this folder. Stop the old Pi process, then restart the daemon.`
-          : `[remote-pi] Could not start: too many agents named "${requestedName}" already running in this folder.`,
-        "warning",
-      );
+      const message = process.env["REMOTE_PI_DAEMON"] === "1"
+          ? `[remote-pi] Daemon not started: another live agent already owns "${requestedName}" in this folder (lock: ${ownerLockPath}) (reason=lock_refused). Stop the old Pi process, then restart the daemon.`
+          : `[remote-pi] Could not start: too many agents named "${requestedName}" already running in this folder (lock: ${ownerLockPath}) (reason=lock_refused).`;
+      ctx.ui.notify(message, "warning");
+      diagnostics.explanation = { message, level: "warning" };
       return;
     }
   }
@@ -2968,7 +3358,20 @@ async function _cmdRootInner(
   // First-time wizard: no local config in this cwd → run interactive setup.
   if (!localConfigExists(cwd)) {
     const ui = ctx.ui as unknown as WizardUI;
-    if (typeof ui.select !== "function") {
+    if (_hasNoInteractiveUi(ctx)) {
+      diagnostics.configDetail = "no_interactive_ui";
+      diagnostics.statusShown = true;
+      // The SDK's print-mode UI drops every notify/status line, so emitting
+      // only `_cmdStatus` leaves `pi -p "/remote-pi"` completely mute. Write
+      // the actionable line to stderr — the channel `_headlessUi()` already
+      // uses. The internal headless ctx (`hasUI` undefined, no `select`) keeps
+      // its current stderr behaviour; interactive/RPC UI keeps its notify path.
+      if ((ctx as { hasUI?: boolean }).hasUI === false) {
+        _writeStderr(
+          "[remote-pi] No config in this folder (reason=no_local_config). " +
+          "Run /remote-pi in an interactive Pi terminal to open the setup wizard.",
+        );
+      }
       _cmdStatus(ctx, { lastStart: false });
       return;
     }
@@ -2979,6 +3382,8 @@ async function _cmdRootInner(
     });
     if (!_isCurrentRootLifecycle(rootLifecycleGeneration)) return;
     if (!newConfig) {
+      diagnostics.configDetail = "setup_cancelled";
+      diagnostics.explanation = { message: "[remote-pi] Setup cancelled.", level: "info" };
       ctx.ui.notify("[remote-pi] Setup cancelled.", "info");
       return;
     }
@@ -2992,16 +3397,23 @@ async function _cmdRootInner(
     );
     if (!_isCurrentRootLifecycle(rootLifecycleGeneration)) return;
     // plan/70: bracket child commands without changing their returns/awaits.
-    recordLifecycle({ event: "join_begin", generation: rootLifecycleGeneration, cwd });
-    await _cmdJoin(ctx);
+    recordLifecycle({ event: "join_begin", outcomeId: diagnostics.id, generation: rootLifecycleGeneration, cwd });
+    diagnostics.stage = "joining_mesh";
+    diagnostics.join = await _runJoin(ctx, _rootScope(diagnostics, rootLifecycleGeneration));
+    if (diagnostics.join.publication) { diagnostics.name = diagnostics.join.publication.name; diagnostics.room = diagnostics.join.publication.room; }
+    diagnostics.explanation = diagnostics.join.explanation;
     _recordRootStepEnd("join", rootLifecycleGeneration, diagnostics);
     if (!_isCurrentRootLifecycle(rootLifecycleGeneration) || !_meshNode) return;
     if (effectiveAutoStartRelay(newConfig)) {
-      recordLifecycle({ event: "relay_connect_begin", generation: rootLifecycleGeneration, cwd });
-      await _cmdStart(ctx);
+      recordLifecycle({ event: "relay_connect_begin", outcomeId: diagnostics.id, generation: rootLifecycleGeneration, cwd });
+      diagnostics.stage = "connecting_relay";
+      diagnostics.relay = await _runStart(ctx, _rootScope(diagnostics, rootLifecycleGeneration));
+      if (diagnostics.relay.publication) { diagnostics.name = diagnostics.relay.publication.name ?? diagnostics.name; diagnostics.room = diagnostics.relay.publication.room; }
+      diagnostics.explanation = diagnostics.relay.explanation;
       _recordRootStepEnd("relay_connect", rootLifecycleGeneration, diagnostics);
     }
     if (!_isCurrentRootLifecycle(rootLifecycleGeneration) || !_meshNode) return;
+    diagnostics.statusShown = true;
     _cmdStatus(ctx, { lastStart: false });
     return;
   }
@@ -3018,19 +3430,26 @@ async function _cmdRootInner(
   if (!_isCurrentRootLifecycle(rootLifecycleGeneration)) return;
   // plan/70: publication is observed only at these existing call sites.
   if (!_meshNode) {
-    recordLifecycle({ event: "join_begin", generation: rootLifecycleGeneration, cwd });
-    await _cmdJoin(ctx);
+    recordLifecycle({ event: "join_begin", outcomeId: diagnostics.id, generation: rootLifecycleGeneration, cwd });
+    diagnostics.stage = "joining_mesh";
+    diagnostics.join = await _runJoin(ctx, _rootScope(diagnostics, rootLifecycleGeneration));
+    if (diagnostics.join.publication) { diagnostics.name = diagnostics.join.publication.name; diagnostics.room = diagnostics.join.publication.room; }
+    diagnostics.explanation = diagnostics.join.explanation;
     _recordRootStepEnd("join", rootLifecycleGeneration, diagnostics);
   }
-  // `_cmdJoin` returns void on a canceled/failed join, so recheck both the
+  // A canceled/failed join must not bring the relay up; recheck both the
   // root lifecycle and publication before bringing the Relay up.
   if (!_isCurrentRootLifecycle(rootLifecycleGeneration) || !_meshNode) return;
   if (effectiveAutoStartRelay(config) && _state === "idle") {
-    recordLifecycle({ event: "relay_connect_begin", generation: rootLifecycleGeneration, cwd });
-    await _cmdStart(ctx);
+    recordLifecycle({ event: "relay_connect_begin", outcomeId: diagnostics.id, generation: rootLifecycleGeneration, cwd });
+    diagnostics.stage = "connecting_relay";
+    diagnostics.relay = await _runStart(ctx, _rootScope(diagnostics, rootLifecycleGeneration));
+    if (diagnostics.relay.publication) { diagnostics.name = diagnostics.relay.publication.name ?? diagnostics.name; diagnostics.room = diagnostics.relay.publication.room; }
+    diagnostics.explanation = diagnostics.relay.explanation;
     _recordRootStepEnd("relay_connect", rootLifecycleGeneration, diagnostics);
   }
   if (!_isCurrentRootLifecycle(rootLifecycleGeneration) || !_meshNode) return;
+  diagnostics.statusShown = true;
   _cmdStatus(ctx, { lastStart: false });
 }
 
@@ -3363,8 +3782,8 @@ async function _cmdPair(ctx: Pick<ExtensionContext, "ui" | "cwd">, args = ""): P
       return;
     }
     ctx.ui.notify("[remote-pi] Starting mesh + relay before pairing…", "info");
-    if (!_meshNode) await _cmdJoin(ctx);
-    if (_state === "idle") await _cmdStart(ctx);
+    if (!_meshNode) await _runJoin(ctx, _directScope("user"));
+    if (_state === "idle") await _runStart(ctx, _directScope("user"));
   }
 
   // Relay must be up — the QR carries a token the app exchanges through
@@ -3450,6 +3869,7 @@ async function _cmdStop(ctx: Pick<ExtensionContext, "ui">): Promise<void> {
 
   const meshNode = _meshNode;
   _meshNode = null;
+  _publishedFallback = null;
   _sessionName = null;
   _sessionPeerCount = 0;
   let meshClose: Promise<void> | null = null;
@@ -3500,8 +3920,8 @@ async function _cmdRevoke(arg: string, ctx: Pick<ExtensionContext, "ui" | "cwd">
       return;
     }
     ctx.ui.notify("[remote-pi] Starting mesh + relay before revoking…", "info");
-    if (!_meshNode) await _cmdJoin(ctx);
-    if (_state === "idle") await _cmdStart(ctx);
+    if (!_meshNode) await _runJoin(ctx, _directScope("user"));
+    if (_state === "idle") await _runStart(ctx, _directScope("user"));
   }
   if (_state === "idle" || !_relay) {
     ctx.ui.notify(
@@ -3652,7 +4072,7 @@ async function _cmdRelay(arg: string, ctx: ExtensionContext): Promise<void> {
       return;
     case "start":
     case "on":
-      if (_getState() === "idle") await _cmdStart(ctx);
+      if (_getState() === "idle") await _runStart(ctx, _directScope("user"));
       else ctx.ui.notify(`[remote-pi] Relay already ${_relayStatus()}.`, "info");
       _emitRelayState(true);
       return;
@@ -4412,7 +4832,8 @@ export function _deliverMeshMessageToAgentForTest(env: MeshEnvelope): void {
  * longer user-configurable: every Pi on the same machine joins the same
  * broker.
  */
-async function _cmdJoin(ctx: Pick<ExtensionContext, "ui" | "cwd">): Promise<void> {
+async function _cmdJoin(ctx: Pick<ExtensionContext, "ui" | "cwd">): Promise<ObservedStep> {
+  if (_disposed) return { result: "stale", reason: "disposed" };
   const cwd = "cwd" in ctx ? (ctx as ExtensionCommandContext).cwd : process.cwd();
   const local = loadLocalConfig(cwd);
   const sessionName = LOCAL_SESSION_NAME;
@@ -4426,7 +4847,7 @@ async function _cmdJoin(ctx: Pick<ExtensionContext, "ui" | "cwd">): Promise<void
 
   if (_meshNode) {
     ctx.ui.notify("[remote-pi] Already on the local mesh.", "warning");
-    return;
+    return { result: "ok", reason: "already_joined", publication: { node: _meshNode, name: _meshNode.name() } };
   }
   const joinGeneration = ++_meshJoinGeneration;
 
@@ -4441,6 +4862,8 @@ async function _cmdJoin(ctx: Pick<ExtensionContext, "ui" | "cwd">): Promise<void
   // realpath so symlinked cwds map to one identity (matches roomIdForCwd).
   let canonCwd = cwd;
   try { canonCwd = realpathSync(cwd); } catch { /* cwd missing — use raw path */ }
+  const defaultName = defaultAgentName(cwd);
+  const fallback = _reservedFallback;
   const peer = new MeshNode({
     sockPath: sock,
     name: agentName,
@@ -4510,6 +4933,7 @@ async function _cmdJoin(ctx: Pick<ExtensionContext, "ui" | "cwd">): Promise<void
     _meshNode === null
   );
 
+  let publication: ObservedStep["publication"];
   try {
     const assigned = await peer.connect();
     // The candidate stays local until connect resolves. Shutdown, stop, or a
@@ -4517,9 +4941,20 @@ async function _cmdJoin(ctx: Pick<ExtensionContext, "ui" | "cwd">): Promise<void
     // ghost peer or allowing _cmdRoot to continue into Relay startup.
     if (!isCurrentCandidate()) {
       try { await peer.close(); } catch { /* best-effort */ }
-      return;
+      return { result: "stale", reason: _disposed ? "disposed" : "lifecycle_superseded", publication };
     }
     _meshNode = peer;
+    publication = { node: peer, name: assigned };
+    let published: PublishedFallback | null = null;
+    if (fallback) {
+      const room = assigned === fallback.reserved && fallback.lockPath.endsWith(".sock")
+        ? fallback.lockPath.slice(fallback.lockPath.lastIndexOf("/") + 1, -5)
+        : identityRoom(canonCwd, defaultName, assigned);
+      _publishedFallback = { node: peer, requested: fallback.requested, effective: assigned,
+        ownerLockPath: fallback.ownerLockPath, room, canonicalTarget: canonCwd, defaultName };
+      publication.room = room;
+      published = _publishedFallback;
+    }
     _sessionName = sessionName;
     _sessionPeerCount = 1;  // optimistic — overwritten by list_peers below
     // Broker broadcasts `peer_joined` only to existing peers when a new one
@@ -4556,14 +4991,41 @@ async function _cmdJoin(ctx: Pick<ExtensionContext, "ui" | "cwd">): Promise<void
     // local broker exists. No-op if the relay isn't up yet (will fire
     // again from `_cmdStart`).
     _attachBridgeIfReady();
+    // plan/70 B2: emit the successful-identity notice only AFTER every
+    // synchronous publication step above succeeded. A later throwing publication
+    // (SDK sendMessage, live UI) must not advertise an identity that was never
+    // fully published.
+    if (published) _notifyFallback(ctx, published);
+    return { result: "ok", reason: "joined", publication };
   } catch (err) {
-    // A replacement/stop/newer join can invalidate this candidate before its
-    // failure arrives. Clean it up and never notify the outgoing session ctx.
+    // plan/70 B2: `_meshNode = peer` is set BEFORE later synchronous publication
+    // steps. A throw there makes `isCurrentCandidate()` false (it requires
+    // `_meshNode === null`), so the old code took the stale branch, closed the
+    // PUBLISHED peer, yet left `_meshNode`/`_publishedFallback` pointing at the
+    // closed node and reported a fictitious supersession. Distinguish the three
+    // cases:
+    //  - this invocation owns the published peer → unpublish it, clear any
+    //    fallback we installed, and report the real failure reason/detail;
+    //  - genuinely superseded (another owner / generation / disposal) → stale,
+    //    leaving the current owner's state untouched;
+    //  - pre-publication candidate failure → honest join failure.
+    if (_meshNode === peer) {
+      _unpublishOwnedNode(peer);
+      try { await peer.close(); } catch { /* best-effort */ }
+      if (_disposed || joinGeneration !== _meshJoinGeneration) {
+        return { result: "stale", reason: _disposed ? "disposed" : "lifecycle_superseded" };
+      }
+      const message = `[remote-pi] join failed: ${String(err)}`;
+      ctx.ui.notify(message, "error");
+      return { result: "failed", reason: "join_failed", detail: errorText(err), explanation: { message, level: "error" } };
+    }
     if (!isCurrentCandidate()) {
       try { await peer.close(); } catch { /* best-effort */ }
-      return;
+      return { result: "stale", reason: _disposed ? "disposed" : "lifecycle_superseded", publication };
     }
-    ctx.ui.notify(`[remote-pi] join failed: ${String(err)}`, "error");
+    const message = `[remote-pi] join failed: ${String(err)}`;
+    ctx.ui.notify(message, "error");
+    return { result: "failed", reason: "join_failed", detail: errorText(err), explanation: { message, level: "error" } };
   }
 }
 

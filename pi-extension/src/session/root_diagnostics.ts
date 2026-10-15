@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { appendFile, mkdir } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
@@ -17,19 +18,27 @@ export type AutoInitSkipReason =
 
 /** Final classification of one `_cmdRoot` run (see classifyRootEnd). */
 export type RootEndReason =
-  | "exception" | "lifecycle_superseded" | "lock_refused" | "no_local_config"
+  | "disposed" | "relay_timeout" | "exception" | "lifecycle_superseded" | "lock_refused" | "no_local_config"
   | "join_not_published" | "relay_not_started" | "connected" | "relay_disabled";
+
+export interface StepOutcome {
+  result: "ok" | "failed" | "stale";
+  reason: string;
+  detail?: string;
+}
 
 export type StepResult = "ok" | "failed" | "stale" | "refused";
 
 export type LifecycleEventName =
   | "session_start_autoinit" | "command"
   | "root_wait_begin" | "root_wait_end" | "root_begin" | "root_end"
+  | "lock_fallback" | "relay_start_begin" | "relay_start_end" | "join_attempt_begin" | "join_attempt_end"
   | "lock_result" | "join_begin" | "join_end" | "relay_connect_begin" | "relay_connect_end";
 
 /** What callers pass. `ts` + `pid` are stamped by recordLifecycle. */
 export interface LifecycleEventInput {
   event: LifecycleEventName;
+  outcomeId?: number;
   decision?: "start" | "skip";
   result?: StepResult;
   reason?: string;          // AutoInitSkipReason | RootEndReason | "alias_of_root" | … (free-form on purpose: Wave B adds more)
@@ -62,6 +71,10 @@ export interface RootOutcome {
 /** Observable state right after `_cmdRootInner` settles. Built by index.ts. */
 export interface RootEndSnapshot {
   error?: { value: unknown };   // present iff the run rejected
+  disposed?: boolean;
+  configDetail?: string;
+  join?: StepOutcome;
+  relay?: StepOutcome;
   lifecycleCurrent: boolean;
   lockHeld: boolean;
   configExists: boolean;
@@ -72,6 +85,9 @@ export interface RootEndSnapshot {
 
 let _pathOverride: string | null = null;
 let _outcome: RootOutcome | null = null;
+let _selectedOutcomeId = 0;
+let _nextOutcomeId = 0;
+export function allocateOutcomeId(): number { return ++_nextOutcomeId; }
 
 export function lifecycleLogPath(): string {
   return _pathOverride ?? join(process.env["REMOTE_PI_HOME"] || homedir(), ".pi", "remote", "logs", "remote-pi.log");
@@ -139,10 +155,12 @@ export function lastRootOutcome(): RootOutcome | null { return _outcome; }
 
 export function classifyRootEnd(s: RootEndSnapshot): { result: "ok" | "failed" | "stale"; reason: RootEndReason; detail?: string } {
   if (s.error) return { result: "failed", reason: "exception", detail: errorText(s.error.value) };
-  if (!s.lifecycleCurrent) return { result: "stale", reason: "lifecycle_superseded" };
+  if (!s.lifecycleCurrent || s.disposed) return { result: "stale", reason: s.disposed ? "disposed" : "lifecycle_superseded" };
   if (!s.lockHeld) return { result: "failed", reason: "lock_refused" };
-  if (!s.configExists) return { result: "failed", reason: "no_local_config" };
+  if (!s.configExists) return { result: "failed", reason: "no_local_config", ...(s.configDetail ? { detail: s.configDetail } : {}) };
+  if (s.join && s.join.result !== "ok") return { result: "failed", reason: "join_not_published", detail: childDetail(s.join) };
   if (!s.meshJoined) return { result: "failed", reason: "join_not_published" };
+  if (s.relay && s.relay.result !== "ok") return { result: "failed", reason: s.relay.reason === "relay_timeout" ? "relay_timeout" : "relay_not_started", detail: childDetail(s.relay) };
   if (s.relayStarted) return { result: "ok", reason: "connected" };
   if (s.autoStartRelay) return { result: "failed", reason: "relay_not_started" };
   return { result: "ok", reason: "relay_disabled" };
@@ -151,8 +169,7 @@ export function classifyRootEnd(s: RootEndSnapshot): { result: "ok" | "failed" |
 export function formatRootOutcomeLine(o: RootOutcome, now: number, logPath: string = lifecycleLogPath()): string {
   const seconds = Math.max(0, Math.floor((now - o.at) / 1000));
   const age = seconds < 60 ? `${seconds}s` : seconds < 3600 ? `${Math.floor(seconds / 60)}m` : `${Math.floor(seconds / 3600)}h`;
-  const home = homedir();
-  const display = logPath.startsWith(home + "/") ? "~" + logPath.slice(home.length) : logPath;
+  const display = displayPath(logPath);
   if (o.result === "pending") return `⚠️ Last start: still running — ${o.reason} (for ${age}) · log: ${display}`;
   return `⚠️ Last start: ${o.result} — ${o.reason}${o.detail ? `: ${trunc(o.detail, 80)}` : ""} (${age} ago) · log: ${display}`;
 }
@@ -165,17 +182,26 @@ export function errorText(err: unknown): string {
 /** Test-only. null restores the default path. */
 export function _setLifecycleLogPathForTest(path: string | null): void { _pathOverride = path; }
 /** Test-only: clears memory, not the path override. */
-export function _resetRootDiagnosticsForTest(): void { _outcome = null; }
+export function _resetRootDiagnosticsForTest(): void { _outcome = null; _selectedOutcomeId = 0; }
 
 function _applyToOutcome(e: LifecycleEventInput, now: number): void {
+  const begins = e.event === "root_begin" || e.event === "relay_start_begin" || e.event === "join_attempt_begin";
+  const ends = e.event === "root_end" || e.event === "relay_start_end" || e.event === "join_attempt_end";
+  const stage = e.event === "join_begin" || e.event === "relay_connect_begin";
+  if (e.outcomeId !== undefined && (begins || ends || stage)) {
+    if (e.outcomeId < _selectedOutcomeId || (stage && e.outcomeId !== _selectedOutcomeId)) return;
+    _selectedOutcomeId = e.outcomeId;
+  }
   switch (e.event) {
     case "session_start_autoinit":
       if (e.decision === "skip" && e.reason !== "already_inited") {
         _outcome = { at: now, result: "skipped", reason: e.reason ?? "unknown", ...(e.detail ? { detail: e.detail } : {}) };
       }
       return;
+    case "relay_start_begin":
+    case "join_attempt_begin":
     case "root_begin":
-      _outcome = { at: now, result: "pending", reason: "root_in_progress" };
+      _outcome = { at: now, result: "pending", reason: e.event === "root_begin" ? "root_in_progress" : e.event === "join_attempt_begin" ? "joining_mesh" : "connecting_relay" };
       return;
     case "join_begin":
     case "relay_connect_begin":
@@ -183,6 +209,8 @@ function _applyToOutcome(e: LifecycleEventInput, now: number): void {
         _outcome = { ..._outcome, reason: e.event === "join_begin" ? "joining_mesh" : "connecting_relay" };
       }
       return;
+    case "relay_start_end":
+    case "join_attempt_end":
     case "root_end":
       _outcome = {
         at: now,
@@ -198,4 +226,23 @@ function _applyToOutcome(e: LifecycleEventInput, now: number): void {
 
 function trunc(s: string, n: number): string {
   return s.length <= n ? s : `${s.slice(0, n - 1)}…`;
+}
+
+function childDetail(outcome: StepOutcome): string { return outcome.reason + (outcome.detail ? `: ${outcome.detail}` : ""); }
+export function displayPath(path: string): string {
+  const home = homedir();
+  return path.startsWith(home + "/") ? "~" + path.slice(home.length) : path;
+}
+export interface LockFallback {
+  requested: string;
+  effective: string;
+  ownerLockPath: string;
+  room?: string;
+}
+export function formatLockFallbackLine(f: LockFallback): string {
+  return `Identity: running as "${f.effective}"${f.room ? ` (identity room ${f.room})` : ""} — "${f.requested}" held by another live Pi (lock: ${displayPath(f.ownerLockPath)}) · reason: lock_suffixed`;
+}
+/** Same room algorithm as rooms.ts, using an already-canonicalized snapshot. */
+export function identityRoom(canonicalTarget: string, defaultName: string, assigned: string): string {
+  return createHash("sha256").update(canonicalTarget + (assigned === defaultName ? "" : "\0" + assigned)).digest("base64url").slice(0, 12);
 }
