@@ -3,6 +3,9 @@ import WebSocket from "ws";
 import { ed25519Sign } from "../pairing/crypto.js";
 import type { Ed25519Keypair } from "../pairing/crypto.js";
 
+import { ConnectTimeoutError, rootDeadlines } from "../session/root_deadlines.js";
+import { captureStartConnect } from "../session/start_attempt.js";
+
 const AUTH_TIMEOUT_MS = 5_000;
 
 /**
@@ -43,6 +46,7 @@ export interface RoomMetaUpdateFrame {
 }
 
 export interface ConnectOptions {
+  timeoutMs?: number;
   roomId?: string;
   roomMeta?: RoomMeta;
 }
@@ -83,6 +87,7 @@ export interface RelayClientEvents {
  */
 export class RelayClient extends EventEmitter {
   private ws: WebSocket | null = null;
+  private cancelConnect: (() => void) | null = null;
   /** Epoch ms of the last inbound frame (message / relay ping / pong). */
   private lastActivityAt = 0;
   private livenessTimer: ReturnType<typeof setInterval> | null = null;
@@ -110,45 +115,61 @@ export class RelayClient extends EventEmitter {
    * `_cmdStart`) maps that to a clearer UI message.
    */
   async connect(options: ConnectOptions = {}): Promise<void> {
+    const observe = captureStartConnect(this);
+    this.cancelConnect?.();
     return new Promise<void>((resolve, reject) => {
       const ws = new WebSocket(this.url);
       this.ws = ws;
-
-      ws.on("error", (err) => reject(err));
-
-      ws.on("open", async () => {
-        try {
-          await this._authenticate(ws, options);
-
-          // Auth done — wire persistent message handler. Every inbound frame
-          // (data, plus the relay's keepalive ping/pong below) refreshes the
-          // liveness clock.
-          this.lastActivityAt = Date.now();
-          ws.on("message", (raw) => {
-            this.lastActivityAt = Date.now();
-            const text = Buffer.isBuffer(raw) ? raw.toString() : String(raw);
-            for (const line of text.split("\n")) {
-              const trimmed = line.trim();
-              if (trimmed) this.emit("message", trimmed);
-            }
-          });
-          // The relay pings every ~25s; `ws` auto-replies Pong (keeping the
-          // relay's view of us alive). The relay ignores client pings rather
-          // than ponging, so these inbound pings — not a ping/pong we initiate
-          // — are our liveness signal.
-          ws.on("ping", () => { this.lastActivityAt = Date.now(); });
-          ws.on("pong", () => { this.lastActivityAt = Date.now(); });
-
-          ws.on("close", () => {
-            this._stopLiveness();
-            this.emit("close");
-          });
-          this._startLiveness(ws);
-          resolve();
-        } catch (err) {
+      let settled = false;
+      const auth = new AbortController();
+      const timeoutMs = options.timeoutMs ?? rootDeadlines().relayConnectMs;
+      const cancel = () => finish({ result: "failed", error: new Error("relay connect cancelled") });
+      const finish = (result: { result: "ok" } | { result: "failed"; error: unknown }) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(deadline);
+        auth.abort();
+        if (this.cancelConnect === cancel) this.cancelConnect = null;
+        observe(result);
+        if (result.result === "failed") {
+          if (this.ws === ws) this.ws = null;
           ws.terminate();
-          reject(err);
-        }
+          reject(result.error);
+        } else resolve();
+      };
+      const deadline = setTimeout(() => finish({ result: "failed", error: new ConnectTimeoutError(timeoutMs) }), timeoutMs);
+      deadline.unref?.();
+      this.cancelConnect = cancel;
+      // Kept for late emitter errors, including terminate() before open.
+      ws.on("error", error => finish({ result: "failed", error }));
+      ws.on("close", () => {
+        if (!settled) finish({ result: "failed", error: new Error("relay closed before authentication") });
+      });
+      ws.on("open", () => {
+        if (settled || this.ws !== ws) return;
+        void (async () => {
+          try {
+            await this._authenticate(ws, options, auth.signal);
+            if (settled || this.ws !== ws) return;
+            this.lastActivityAt = Date.now();
+            ws.on("message", raw => {
+              this.lastActivityAt = Date.now();
+              const text = Buffer.isBuffer(raw) ? raw.toString() : String(raw);
+              for (const line of text.split("\n")) {
+                const trimmed = line.trim();
+                if (trimmed) this.emit("message", trimmed);
+              }
+            });
+            ws.on("ping", () => { this.lastActivityAt = Date.now(); });
+            ws.on("pong", () => { this.lastActivityAt = Date.now(); });
+            ws.on("close", () => {
+              if (this.ws === ws) this._stopLiveness();
+              this.emit("close");
+            });
+            this._startLiveness(ws);
+            finish({ result: "ok" });
+          } catch (error) { finish({ result: "failed", error }); }
+        })();
       });
     });
   }
@@ -178,6 +199,7 @@ export class RelayClient extends EventEmitter {
   }
 
   close(): void {
+    this.cancelConnect?.();
     this._stopLiveness();
     this.ws?.close();
     this.ws = null;
@@ -207,14 +229,16 @@ export class RelayClient extends EventEmitter {
 
   // ── Auth ────────────────────────────────────────────────────────────────────
 
-  private async _authenticate(ws: WebSocket, opts: ConnectOptions): Promise<void> {
+  private async _authenticate(ws: WebSocket, opts: ConnectOptions, signal: AbortSignal): Promise<void> {
+    signal.throwIfAborted();
     const pubkeyB64 = Buffer.from(this.keypair.publicKey).toString("base64");
     const hello: HelloMsg = { type: "hello", pubkey: pubkeyB64 };
     if (opts.roomId) hello.room_id = opts.roomId;
     if (opts.roomMeta) hello.room_meta = opts.roomMeta;
     this._rawSend(ws, JSON.stringify(hello));
 
-    const challengeRaw = await this._nextMsg(ws);
+    const challengeRaw = await this._nextMsg(ws, signal);
+    signal.throwIfAborted();
     let challenge: ChallengeMsg | { type: "error"; code?: string; message?: string };
     try {
       challenge = JSON.parse(challengeRaw) as typeof challenge;
@@ -245,16 +269,25 @@ export class RelayClient extends EventEmitter {
   }
 
   /** Waits for the next single WS message with a timeout. */
-  private _nextMsg(ws: WebSocket): Promise<string> {
+  private _nextMsg(ws: WebSocket, signal: AbortSignal): Promise<string> {
     return new Promise<string>((resolve, reject) => {
-      const timer = setTimeout(
-        () => reject(new Error("relay auth timeout")),
-        AUTH_TIMEOUT_MS,
-      );
-      ws.once("message", (raw) => {
+      const cleanup = () => {
         clearTimeout(timer);
-        resolve(Buffer.isBuffer(raw) ? raw.toString() : String(raw));
-      });
+        ws.off("message", message);
+        ws.off("error", error);
+        ws.off("close", close);
+        signal.removeEventListener("abort", abort);
+      };
+      const error = (err: unknown) => { cleanup(); reject(err); };
+      const message = (raw: unknown) => { cleanup(); resolve(Buffer.isBuffer(raw) ? raw.toString() : String(raw)); };
+      const close = () => error(new Error("relay closed during authentication"));
+      const abort = () => error(signal.reason);
+      const timer = setTimeout(() => error(new Error("relay auth timeout")), AUTH_TIMEOUT_MS);
+      ws.once("message", message);
+      ws.once("error", error);
+      ws.once("close", close);
+      signal.addEventListener("abort", abort, { once: true });
+      if (signal.aborted) abort();
     });
   }
 

@@ -219,7 +219,17 @@ The wizard asks three questions:
    `/remote-pi` to also connect to the relay so the mobile app can reach this
    Pi. `No` for local-only use (agent network without mobile access).
 
-Re-run the wizard later with `/remote-pi setup`.
+Re-run the wizard later with `/remote-pi setup` (saves config; run `/remote-pi`
+to apply it). A user invocation always answers in a live context: an existing
+step error or “Setup cancelled.” counts; it does not add a duplicate warning.
+A second `/remote-pi` waits up to 500 ms for existing startup, then prints status
+and “Still connecting…” if that same startup is still pending. `/remote-pi stop`
+invalidates startup authority, not necessarily the underlying keychain, mesh or
+socket-bind work. A first startup can still wait on those operations; automatic
+session replacement still drains outgoing work to completion.
+
+Relay connection (WebSocket open plus authentication) has a 20-second deadline.
+This deadline does not cover local mesh startup or lock acquisition.
 
 ---
 
@@ -402,7 +412,12 @@ Useful commands:
 
 Name collisions inside a session get a numeric suffix automatically
 (`backend`, `backend#2`, `backend#3`). The broker assigns it and returns the
-real name to the peer.
+real name to the peer. If another live Pi holds the requested folder/name lock,
+startup warns with its lock path and the **published** effective name and identity
+room. The broker can assign a different name from the reserved lock candidate.
+This is a separate identity to paired apps and peers. Status retains an Identity
+line while that publication is live (and labels relay-off rooms accordingly).
+To use the original name, quit the other Pi, then run `/reload`.
 
 ---
 
@@ -625,7 +640,15 @@ Use the selected pid and time window to find related begin/wait events
 reproduce a fresh occurrence using the instrumented build.
 Writes are deferred, ordered within each process and best-effort; abrupt
 process exit can lose buffered records. There is no log rotation.
-To bring the relay up directly, run `/remote-pi relay start`.
+To bring the relay up directly, run `/remote-pi relay start`. A disposed-instance
+warning means run `/reload` (or restart Pi); a superseded-start warning means stop,
+relay off, a session change or a newer start took authority. Run status before
+retrying. No notifications are sent into a destroyed outgoing session context.
+
+Upstream #128's future initial-connect retry calls `_cmdStart` directly. It must
+route through `_runStart` to update Last-start for retry results; until that
+upstream adjustment, transport cleanup still applies but retry outcomes are not
+covered by this observation wrapper.
 
 **Footer says `🟡 relay waiting for pairing` even though I paired a device.**
 The icon reflects whether *any* device has been paired on this machine, not
