@@ -114,6 +114,7 @@ state at the next mutation.
 | Variable | Default | Description |
 |---|---|---|
 | `REMOTEPI_RELAY_PORT` | `3000` | TCP port that serves the WebSocket upgrade, `/health`, and `/mesh/*` (all on the same port) |
+| `REMOTEPI_RELAY_HOST` | `0.0.0.0` | IP address to bind to. The default listens on **all interfaces**, so anyone on your LAN can reach the relay over plain HTTP/WS. Set to `127.0.0.1` (or `::1`) to accept local connections only — e.g. when fronted by Tailscale serve or a reverse proxy on the same host. Don't set this inside Docker unless you use host networking: `-p` forwarding can't reach a container bound to loopback. An invalid value aborts startup |
 | `REMOTEPI_MESH_DB_PATH` | `/data/mesh.db` in Docker · `data/mesh.db` (cwd-relative) for bare-metal builds | Path to the SQLite database that stores signed membership versions. The parent directory is created automatically on first boot. The Docker image presets this to `/data/mesh.db` and declares `/data` as a volume — see the volume note above |
 | `RUST_LOG` | _(none)_ | Log level filter — e.g. `info`, `debug`, `warn` |
 
@@ -194,6 +195,12 @@ cargo build --release
 
 ```bash
 REMOTEPI_RELAY_PORT=8080 RUST_LOG=info ./target/release/relay
+```
+
+Loopback-only (not reachable from the LAN):
+
+```bash
+REMOTEPI_RELAY_HOST=127.0.0.1 ./target/release/relay
 ```
 
 ## Running tests

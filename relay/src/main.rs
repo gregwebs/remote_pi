@@ -1,9 +1,29 @@
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 
 use anyhow::Context;
 use tokio::net::TcpListener;
 use tracing::info;
+
+/// Interface the relay binds to, from `REMOTEPI_RELAY_HOST`.
+///
+/// Defaults to `0.0.0.0` (all interfaces) to stay backwards compatible with
+/// Docker deployments, where the container must listen on all interfaces for
+/// published ports to work. Set it to `127.0.0.1` (or `::1`) to accept local
+/// connections only, e.g. when running behind Tailscale serve or a reverse
+/// proxy on the same host.
+///
+/// An invalid value is a hard error: silently falling back to `0.0.0.0`
+/// would expose a relay the operator meant to keep private.
+fn bind_host() -> anyhow::Result<IpAddr> {
+    match std::env::var("REMOTEPI_RELAY_HOST") {
+        Ok(s) if !s.trim().is_empty() => s
+            .trim()
+            .parse()
+            .with_context(|| format!("invalid REMOTEPI_RELAY_HOST {s:?} (expected an IP address)")),
+        _ => Ok(IpAddr::V4(Ipv4Addr::UNSPECIFIED)),
+    }
+}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -62,8 +82,8 @@ async fn main() -> anyhow::Result<()> {
     };
     let app = relay::build_router(state);
 
-    let addr = format!("0.0.0.0:{port}");
-    let listener = TcpListener::bind(&addr)
+    let addr = SocketAddr::new(bind_host()?, port);
+    let listener = TcpListener::bind(addr)
         .await
         .with_context(|| format!("failed to bind {addr}"))?;
 
